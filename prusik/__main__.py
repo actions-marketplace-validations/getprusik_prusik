@@ -27,7 +27,24 @@ def _slug(value: str) -> str:
     return value
 
 
+# Hook commands the host fires on EVERY tool call / turn / session. Declared once: drives
+# both the fast dispatch below and the `gate` subparser registration, so they can't drift.
+HOOK_COMMANDS = ("pre-tool", "post-tool", "stop", "session-start")
+_HOOK_HELP = {"pre-tool": "PreToolUse hook",
+              "post-tool": "PostToolUse hook — convergence-stall detector",
+              "stop": "Stop hook",
+              "session-start": "SessionStart hook"}
+
+
 def main():
+    # Hot path (platform plan P0): an exact `gate <hook>` argv dispatches before the
+    # ~108-subparser tree is built (~22ms per tool call). Hooks take no arguments; any
+    # other argv (`--help`, extras) falls through to the full parser unchanged.
+    argv = sys.argv[1:]
+    if len(argv) == 2 and argv[0] == "gate" and argv[1] in HOOK_COMMANDS:
+        from prusik import gate
+        return getattr(gate, argv[1].replace("-", "_"))()
+
     parser = argparse.ArgumentParser(prog="prusik", description="Prusik")
     parser.add_argument("--version", action="version",
                         version=f"prusik {__version__}")
@@ -72,10 +89,8 @@ def main():
 
     p_gate = sub.add_parser("gate", help="Hook-invoked and CLI gate commands")
     gsub = p_gate.add_subparsers(dest="gate_cmd", required=True)
-    gsub.add_parser("pre-tool", help="PreToolUse hook")
-    gsub.add_parser("post-tool", help="PostToolUse hook — convergence-stall detector")
-    gsub.add_parser("stop", help="Stop hook")
-    gsub.add_parser("session-start", help="SessionStart hook")
+    for hook in HOOK_COMMANDS:
+        gsub.add_parser(hook, help=_HOOK_HELP[hook])
     p_adv = gsub.add_parser("advance", help="Advance to next phase")
     p_adv.add_argument("phase")
     p_adv.add_argument("--feature", required=True, type=_slug)
@@ -301,7 +316,9 @@ def main():
     p_done = gsub.add_parser("sprint-complete", help="Close a sprint; record actuals")
     p_done.add_argument("--feature", required=True, type=_slug)
     p_done.add_argument("--duration-min", type=int, default=None)
-    p_done.add_argument("--tokens", type=int, default=None)
+    p_done.add_argument("--tokens", type=int, default=None,
+                        help="Ignored: token usage is measured from the session transcripts "
+                             "(accepted so unrefreshed templates keep working)")
     p_done.add_argument("--escalated", action="store_true",
                         help="Set if the sprint escalated solo→team mid-flight")
 
@@ -475,6 +492,21 @@ def main():
                                    "rewind-churn, friction. --json for all.")
     p_effort.add_argument("--json", action="store_true",
                           help="Emit machine-readable JSON instead of text")
+
+    # tier — model-tier routing policy (prusik/model_tier.py, imported only when dispatched).
+    p_tier = sub.add_parser("tier", help="Model-tier routing: resolve a role's model; "
+                                         "report predicted vs measured routing")
+    tsub = p_tier.add_subparsers(dest="tier_cmd", required=True)
+    p_tres = tsub.add_parser("resolve", help="Resolve role -> tier class -> model for a "
+                                             "feature; --role records the spawn-time prediction")
+    p_tres.add_argument("feature")
+    g = p_tres.add_mutually_exclusive_group()
+    g.add_argument("--role", default=None,
+                   help="Print exactly one line, model=<ref> or model=off, for the orchestrator")
+    g.add_argument("--json", action="store_true", help="Emit the resolution as JSON")
+    p_trep = tsub.add_parser("report", help="Read-only: predicted tiers vs measured models "
+                                            "and bounces per completed sprint (advisory, rc 0)")
+    p_trep.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # overhead — the COST lens (fb-e7fe8177cc8c): what the harness itself
     # costs, so a slow gate gets named and tuned instead of the whole harness
@@ -1070,6 +1102,12 @@ def main():
     if args.cmd == "effort":
         from prusik import effort
         return effort.run(json_output=args.json)
+    if args.cmd == "tier":
+        from prusik import model_tier
+        if args.tier_cmd == "resolve":
+            return model_tier.run_resolve(args.feature, args.role, args.json)
+        if args.tier_cmd == "report":
+            return model_tier.run_report(args.json)
     if args.cmd == "overhead":
         from prusik import overhead
         return overhead.run(json_output=args.json,

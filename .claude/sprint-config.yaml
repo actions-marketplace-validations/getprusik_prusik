@@ -16,9 +16,20 @@ phases:
   - name: scoping
     writable:
       - "design/{feature}/scope.md"
+      - "design/{feature}/trivial.md"
+      - "reports/{feature}/scope-approval.txt"
     exit_artifacts:
       - path: "design/{feature}/scope.md"
         validator: scope_schema
+      - path: "reports/{feature}/scope-approval.txt"
+        must_contain: "APPROVED"
+    # Synced with the shipped template (2026-10-25): the self-hosting config had
+    # drifted — no trivial.md, so `--trivial` sprints couldn't write their artifact.
+    trivial_exit_artifacts:
+      - path: "design/{feature}/trivial.md"
+        required_sections:
+          - "## Change"
+          - "## How verified"
 
   - name: triage
     writable:
@@ -39,7 +50,6 @@ phases:
           - "## Risks"
       - path: "reports/{feature}/plan-approval.txt"
         must_contain: "APPROVED"
-    budget_tokens: 150000
 
   - name: solo_execute
     writable:
@@ -49,7 +59,6 @@ phases:
     deny_commands:
       - "git push"
       - "git merge"
-    budget_tokens: 400000
 
   - name: building
     writable:
@@ -59,7 +68,6 @@ phases:
     deny_commands:
       - "git push"
       - "git merge"
-    budget_tokens: 1000000
 
   - name: reviewing
     writable:
@@ -95,6 +103,12 @@ pre_sprint_gates:
     require_artifact: "reports/{feature}/brief-critique.txt"
     must_contain: "PASS"
     hint: "invoke brief-critic role first; it produces reports/{feature}/brief-critique.txt"
+
+# Model tiers (v0.231.0): prusik resolves each role's tier class from triage signals and
+# .claude/model-profile.yaml maps the class to a model. Before each role spawn the orchestrator
+# runs `prusik tier resolve <feature-slug> --role <role>` and passes model=<ref>; rc != 0 = STOP.
+model_tiering:
+  enabled: true
 
 triage:
   heuristics:

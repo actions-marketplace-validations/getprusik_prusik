@@ -1,0 +1,47 @@
+{
+  "id": "fb-35f64503cc75",
+  "created_at": "2026-10-26T00:03:14.425977+00:00",
+  "kind": "bug",
+  "severity": "med",
+  "title": "blast_plan import reach is zero for a changed package __init__.py (queried as pkg.__init__, matches no edge)",
+  "detail": "Surfaced by brief-critic review of python-from-import-edges (2026-10-25). blast_plan._import_reach strips the file extension to build the module prefix, so a changed pkg/__init__.py is queried as \"pkg.__init__\" \u2014 no import edge is ever named that, so importers of the package (import pkg / from pkg import x) are never flagged at-risk. Fix: map a trailing \"/__init__\" to the package itself (\"pkg\") before blast_radius, with a test that a change to pkg/__init__.py flags an `import pkg` test.",
+  "feature": null,
+  "content_hash": "35f64503cc75",
+  "repro": "",
+  "duplicate_of": null,
+  "thread": [],
+  "resolution": {
+    "type": "fix",
+    "verify": "CUR=$(prusik --version 2>/dev/null | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1); [ -n \"$CUR\" ] && [ \"$(printf '%s\\n%s\\n' '0.226.0' \"$CUR\" | sort -V | head -1)\" = '0.226.0' ] && echo \"1 passed: engine carries moat-proven fix fb-35f64503cc75 (prusik $CUR >= 0.226.0)\"",
+    "fixed_in": "0.226.0",
+    "reason": "",
+    "verify_kind": "tests"
+  },
+  "verify_history": [
+    {
+      "at": "2026-10-26T05:08:29.405713+00:00",
+      "exit": 1,
+      "executed_count": 0,
+      "verdict": false,
+      "why": "command exited 1 (non-zero) \u2014 not clean",
+      "worktree_hash": "ae6ab23-dirty"
+    },
+    {
+      "at": "2026-10-26T05:08:29.887855+00:00",
+      "exit": 1,
+      "executed_count": 0,
+      "verdict": false,
+      "why": "command exited 1 (non-zero) \u2014 not clean",
+      "worktree_hash": "ae6ab23-dirty"
+    },
+    {
+      "at": "2026-10-26T06:08:28.467380+00:00",
+      "exit": 0,
+      "executed_count": 1,
+      "verdict": true,
+      "why": "1 test(s) executed, exit 0",
+      "worktree_hash": "64026f2-dirty"
+    }
+  ],
+  "status": "verified-closed"
+}

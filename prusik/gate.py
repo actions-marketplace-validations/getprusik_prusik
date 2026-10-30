@@ -15,15 +15,34 @@ import shlex
 import sys
 from pathlib import Path
 
-from prusik import consistency, discovery, gate_class, ledger, phases, schema
+# Only what the per-tool-call hooks run (platform plan P0). schema / consistency /
+# discovery are imported inside the functions that use them — re-adding them here costs
+# every adopter ~12ms per tool call (pinned: tests/test_hook_hot_path.py).
+from prusik import gate_class, ledger, phases
 
 
 def _read_stdin_json() -> dict:
+    # OSError: stdin unreadable (closed, or captured under a test runner); ValueError covers
+    # JSONDecodeError. A hook payload that can't be read is an empty one, never a crash.
     try:
         raw = sys.stdin.read()
-        return json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
+        data = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _register_session(payload: dict) -> None:
+    """Record this hook's session transcript so token usage can be measured from it
+    (fb-a1b7db140a5e). The adapter turns the native payload into a neutral SessionRef;
+    `usage.register` touches only the registry and never raises."""
+    from prusik import usage
+    from prusik.platform_adapter import get_adapter
+    try:
+        ref = get_adapter().session_ref(payload)
+    except Exception:  # noqa: BLE001 — a hook must never fail on bookkeeping
+        return
+    usage.register(ref)
 
 
 def pre_tool(args=None) -> int:
@@ -67,9 +86,152 @@ def pre_tool(args=None) -> int:
 
     state = phases.current_sprint_state()
     if not state:
+        # No active sprint: the lease above is the only deny on this path, so the write is
+        # allowed — a first brief write here opens its briefing window (fb-1e3ecda9d011).
+        _record_briefing_for_event(event, None)
         return 0  # no active sprint
 
-    return _gate_tool_event(event, config, state["phase"], state.get("feature"), adapter)
+    reason = _gate_decision(event, config, state["phase"], state.get("feature"))
+    if reason is not None:
+        return adapter.deny(reason)
+    # Only a write the gate ALLOWED is recorded: a denied write never happened. Keyed on the
+    # policy decision, not the exit code (a host's deny can exit 0).
+    _record_briefing_for_event(event, state.get("feature"))
+    return 0
+
+
+# ---- briefing window (fb-1e3ecda9d011) ---------------------------------------------------
+# A brief's first write opens a `briefing` span on the effort timeline, so the briefing work
+# before `sprint_started` (brief + brief-critic) is attributed to the sprint it briefs. The
+# event is SYSTEM-recorded here (and by `prusik serve` through the same recorder), never
+# claimed. Runs on every tool call: a cheap "briefs" substring guard comes before any path or
+# marker work, and only already-loaded modules (os, json, ledger, phases) are used.
+
+def _briefing_marker_path() -> Path:
+    """`.sprint/briefing.json` beside the ledger — the same root resolution `ledger.append`
+    uses, so the event and the marker can never land in different `.sprint/` dirs."""
+    return ledger.ledger_path().parent / "briefing.json"
+
+
+def _read_briefing_marker() -> dict:
+    """The `{slug: iso ts}` marker; a missing, corrupt or non-dict marker reads as {}."""
+    try:
+        data = json.loads(_briefing_marker_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_briefing_marker(marker: dict) -> None:
+    """Atomic replace (temp file + os.replace), so a reader never sees a half-written marker."""
+    path = _briefing_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def briefing_failed(source: str, exc: BaseException) -> None:
+    """Every caught briefing-recorder fault leaves a ledger event — never a silent
+    degradation. The ONE definition of the `briefing_record_failed` event shape; `source`
+    names the entry that faulted (file_targets, bash_redirect, recorder, clear, serve)."""
+    try:
+        ledger.append("briefing_record_failed", source=source,
+                      error_type=type(exc).__name__, error=str(exc)[:500])
+    except Exception:  # noqa: BLE001 — an unwritable ledger fails every sprint write alike
+        pass
+
+
+def _brief_slug(target: str, real_root: str) -> str | None:
+    """The slug a write target briefs, or None. Only `briefs/<name>` exactly (two parts)
+    inside the project root matches: `<slug>.criteria.yaml` or `<slug>.md`."""
+    t = str(target)
+    if os.path.isabs(t):
+        rel = os.path.relpath(os.path.realpath(t), real_root)
+    else:
+        rel = os.path.normpath(t)
+    rel = rel.replace("\\", "/")
+    if rel == ".." or rel.startswith("../"):
+        return None                                  # outside the project
+    parts = rel.split("/")
+    if len(parts) != 2 or parts[0] != "briefs":
+        return None
+    name = parts[1]
+    if name.endswith(".criteria.yaml"):
+        slug = name[:-len(".criteria.yaml")]
+    elif name.endswith(".md"):
+        slug = name[:-3]
+    else:
+        return None
+    if not slug or slug.startswith("."):
+        return None
+    return slug
+
+
+def record_briefing(targets: list[str], active_feature: str | None) -> list[str]:
+    """The ONE briefing recorder (the PreToolUse hook and `prusik serve` both call it).
+    Appends `briefing_started` (feature=slug) for each newly briefed slug and upserts the
+    `.sprint/briefing.json` dedup marker. Returns the slugs recorded. Never raises: a fault
+    goes to `briefing_failed("recorder", exc)` and returns []. Callers record their own
+    faults outside this call through the same public `briefing_failed`."""
+    try:
+        cand = [t for t in targets if "briefs" in str(t)]
+        if not cand:
+            return []                                # the hot-path cost: no path, no marker
+        real_root = os.path.realpath(ledger.project_root())
+        slugs: list[str] = []
+        for t in cand:
+            slug = _brief_slug(t, real_root)
+            if slug and slug != active_feature and slug not in slugs:
+                slugs.append(slug)
+        if not slugs:
+            return []
+        marker = _read_briefing_marker()
+        fresh = [s for s in slugs if s not in marker]
+        if not fresh:
+            return []
+        from datetime import datetime, timezone      # already loaded by ledger
+        for slug in fresh:
+            ledger.append("briefing_started", feature=slug)
+            marker[slug] = datetime.now(timezone.utc).isoformat()
+        _write_briefing_marker(marker)
+        return fresh
+    except Exception as exc:  # noqa: BLE001 — a hook must never fail, nor fail silently
+        briefing_failed("recorder", exc)
+        return []
+
+
+def _record_briefing_for_event(event, active_feature: str | None) -> None:
+    """The hook's only entry point to the recorder. Each target source is computed in its
+    own guarded step, so a fault in one never disables the other, and each fault leaves a
+    `briefing_record_failed` event. Never raises."""
+    try:
+        targets = list(event.file_targets)
+    except Exception as exc:  # noqa: BLE001
+        briefing_failed("file_targets", exc)
+        targets = []
+    command = getattr(event, "command", None)
+    # The "briefs" substring guard comes first: a redirect into briefs/ names it, so every
+    # other Bash call skips the redirect scan entirely.
+    if command and "briefs" in command:
+        try:
+            targets += list(_bash_redirect_targets(_strip_heredocs(command)))
+        except Exception as exc:  # noqa: BLE001
+            briefing_failed("bash_redirect", exc)
+    if targets:
+        record_briefing(targets, active_feature)
+
+
+def clear_briefing(slug: str) -> None:
+    """Remove `slug` from the marker (sprint_start, after its `sprint_started` append), so a
+    later re-brief of the same slug opens a fresh window. Never raises."""
+    try:
+        marker = _read_briefing_marker()
+        if slug in marker:
+            del marker[slug]
+            _write_briefing_marker(marker)
+    except Exception as exc:  # noqa: BLE001
+        briefing_failed("clear", exc)
 
 
 # fb-0b9d0a6d1ce6 — what counts as "mutating the SHARED tree" (vs a worktree,
@@ -137,9 +299,18 @@ def _mutates_shared_tree(event) -> bool:
 
 
 def _gate_tool_event(event, config: dict, phase: str, feature, adapter) -> int:
-    """Host-agnostic gate policy over a neutral ToolEvent. Returns the adapter's deny exit
-    code if the event is blocked, else 0. Identical decisions/ledger records/messages as
-    before the v0.22 adapter seam — only the I/O (event parsing + deny) is now adapter-owned."""
+    """Host-agnostic gate policy over a neutral ToolEvent, expressed through the adapter:
+    the adapter's deny exit code if the event is blocked, else 0. The policy itself is
+    `_gate_decision`; only the expression (deny) is adapter-owned."""
+    reason = _gate_decision(event, config, phase, feature)
+    return adapter.deny(reason) if reason is not None else 0
+
+
+def _gate_decision(event, config: dict, phase: str, feature) -> str | None:
+    """The gate's POLICY over a neutral ToolEvent: the deny message if the event is blocked
+    (its `gate_blocked` ledger record already appended), else None. Separate from the
+    adapter's expression of a deny — a host may express a deny with exit 0 (Claude Code:
+    JSON on stdout), so "allowed" is this None, never an exit code."""
     for target in event.file_targets:
         ok, reason = phases.is_path_writable(target, config, phase, feature)
         if not ok:
@@ -152,8 +323,8 @@ def _gate_tool_event(event, config: dict, phase: str, feature, adapter) -> int:
                           phase=phase, feature=feature,
                           gate_class=gate_class.WRITABLE_SCOPE, reason=reason,
                           redirect_rel=rel)
-            return adapter.deny(_writable_scope_deny_msg(
-                "write", target, reason, config, phase, feature))
+            return _writable_scope_deny_msg(
+                "write", target, reason, config, phase, feature)
 
     if event.command is not None:
         cmd = event.command
@@ -171,8 +342,8 @@ def _gate_tool_event(event, config: dict, phase: str, feature, adapter) -> int:
                               phase=phase, feature=feature,
                               gate_class=gate_class.WRITABLE_SCOPE,
                               reason=f"bash redirect to unwriteable path: {target} ({reason})")
-                return adapter.deny(_writable_scope_deny_msg(
-                    "bash redirect", target, reason, config, phase, feature))
+                return _writable_scope_deny_msg(
+                    "bash redirect", target, reason, config, phase, feature)
 
         # Preferred: deny_commands — token-based match. Immune to prose
         # inside heredocs or strings because we check command-position only.
@@ -182,7 +353,7 @@ def _gate_tool_event(event, config: dict, phase: str, feature, adapter) -> int:
                               phase=phase, feature=feature,
                               gate_class=gate_class.DENY_COMMAND,
                               reason=f"deny command: {denied}")
-                return adapter.deny(f"[prusik-gate] phase '{phase}' blocks command: {denied!r}")
+                return f"[prusik-gate] phase '{phase}' blocks command: {denied!r}"
 
         # Legacy: deny_bash — raw regex. Kept for back-compat with configs
         # authored before v0.3.5.
@@ -192,9 +363,9 @@ def _gate_tool_event(event, config: dict, phase: str, feature, adapter) -> int:
                               phase=phase, feature=feature,
                               gate_class=gate_class.DENY_COMMAND,
                               reason=f"deny pattern: {pattern}")
-                return adapter.deny(f"[prusik-gate] phase '{phase}' blocks bash pattern /{pattern}/")
+                return f"[prusik-gate] phase '{phase}' blocks bash pattern /{pattern}/"
 
-    return 0
+    return None
 
 
 # v0.8.9: When a deny fires on a path the agent COULD have written to had
@@ -438,12 +609,15 @@ def _strip_heredocs(cmd: str) -> str:
 
 def stop(args=None) -> int:
     payload = _read_stdin_json()
-    if payload.get("stop_hook_active"):
-        return 0  # avoid infinite loop
-
     config = phases.load_sprint_config()
     if not config:
         return 0
+    # Before every other early return: a continued turn or a paused sprint is still a live
+    # session whose transcript holds the phase's usage.
+    _register_session(payload)
+    if payload.get("stop_hook_active"):
+        return 0  # avoid infinite loop
+
     state = phases.current_sprint_state()
     if not state:
         return 0
@@ -712,6 +886,7 @@ def session_start(args=None) -> int:
     config = phases.load_sprint_config()
     if not config:
         return 0
+    _register_session(_read_stdin_json())
     state = phases.current_sprint_state()
     if not state:
         ctx = "[prusik] No active sprint. Write briefs/<feature>.md and use /sprint-start."
@@ -719,6 +894,11 @@ def session_start(args=None) -> int:
         feature = state.get("feature")
         phase = state.get("phase")
         ctx = f"[prusik] Active sprint '{feature}' in phase '{phase}'. Run /sprint-status for details."
+    # fb-392958c3076a: name the feedback channel on the one prusik surface the agent always
+    # reads — a harness insight/bug/friction otherwise gets parked where prusik can't see it.
+    ctx += ("\n[prusik] Bug, friction, or idea about prusik itself? File it (rides to the "
+            "maintainers): `prusik feedback \"<one line>\" --kind bug|friction|request "
+            "--detail \"<what happened>\"`")
     # v0.86.0 — surface engine↔template skew at session start so a restart-needed
     # state is impossible to miss (CC can't be force-restarted; this makes it loud).
     try:
@@ -744,6 +924,7 @@ def sprint_init(args) -> int:
     next-step guidance when an LLM step is needed (cartographer, brief-critic).
     Idempotent — re-run until it advances into scoping.
     """
+    from prusik import discovery
     feature = args.feature
     root = ledger.project_root()
     config = phases.load_sprint_config(root)
@@ -903,6 +1084,7 @@ _PROTECTED_PHASES = frozenset({"solo_execute", "building", "reviewing", "integra
 
 
 def sprint_start(args) -> int:
+    from prusik import schema
     feature = args.feature
     root = ledger.project_root()
 
@@ -1040,6 +1222,7 @@ def sprint_start(args) -> int:
     _mc.snapshot(root)
     ledger.append("sprint_started", feature=feature, cleaned_worktrees=cleaned,
                   lane=state.get("lane", "standard"))
+    clear_briefing(feature)   # fb-1e3ecda9d011: a later re-brief opens a fresh window
 
     # Charter freshness — ADVISORY, never blocks (a stale vision is a smell, not a
     # defect; blocking a sprint because the human hasn't revisited the north-star
@@ -1106,6 +1289,7 @@ def prove_red(args) -> int:
     the sprint-complete gate then requires alongside GREEN. Run before implementing.
     """
     import subprocess
+    from prusik import schema
     feature = args.feature
     root = ledger.project_root()
     criteria_path = schema.criteria_path_for_brief(root / "briefs" / f"{feature}.md")
@@ -1207,6 +1391,7 @@ def _run_success_criteria(feature: str, root: Path) -> tuple[bool, list[dict]]:
       - Ledger event `success_criterion_verified` emitted per criterion.
     """
     import subprocess
+    from prusik import schema
 
     brief_path = root / "briefs" / f"{feature}.md"
     criteria_path = schema.criteria_path_for_brief(brief_path)
@@ -1509,12 +1694,36 @@ def sprint_complete(args) -> int:
         print("\n".join(lines), file=sys.stderr)
         return 1
 
+    # fb-afbe9deead21: the reviewing-deferred test tier (reviewing_defer_markers) must
+    # have RUN somewhere before done — sprint-complete is its destination. Blocks by
+    # default; `deferred_tier: {require: false}` is the loud operator opt-out.
+    from prusik import deferred_tier
+    _sc_config = phases.load_sprint_config() or {}     # shared by the terminal gates below
+    if not deferred_tier.gate_check(root, _sc_config, feature, verify_results):
+        return 2
+
     predicted = _recover_predicted(root, feature)
     actual = {
         "mode": predicted.get("mode"),  # will be overwritten by --escalated
         "duration_min": args.duration_min,
-        "tokens": args.tokens,
+        "tokens": None,
     }
+    # fb-a1b7db140a5e: tokens are MEASURED from the session transcripts. A `--tokens` value is
+    # an agent claim and is never recorded as the actual (accepted so unrefreshed templates
+    # keep working). Unmeasured is loud and recorded, never a silent null; it doesn't block
+    # completion — telemetry isn't a correctness gate.
+    from prusik import usage
+    if args.tokens is not None:
+        print("[prusik-gate] --tokens ignored: token usage is measured from the session "
+              "transcripts.", file=sys.stderr)
+    measured = usage.measure(feature)
+    if measured.measured:
+        actual["tokens"] = measured.tokens
+        actual["usage"] = measured.breakdown()
+        print(f"[prusik-gate] tokens measured: {measured.tokens:,}", file=sys.stderr)
+    else:
+        actual["tokens_unmeasured"] = measured.reason
+        print(f"[prusik-gate] tokens UNMEASURED: {measured.reason}", file=sys.stderr)
 
     # v0.3.11: if the operator didn't pass --duration-min, fall back to
     # ledger-derived wall-clock (sprint_started timestamp to now). Digest
@@ -1554,7 +1763,6 @@ def sprint_complete(args) -> int:
     # exactly the artifact that must not live on one disk. Same semantics as
     # the advance check: advisory + event, blocking under require.
     from prusik import push_guard
-    _sc_config = phases.load_sprint_config() or {}
     if not push_guard.gate_check(root, _sc_config, feature, "sprint-complete"):
         return 2
 
@@ -1638,12 +1846,34 @@ def _check_convergence_stall(feature: str, current: str | None,
     return 2
 
 
+_FULL_SUITE_REMEDY = ("`prusik prove --kind tests -- <full test command>`, or a green "
+                      "full-suite `prusik gate capture --kind tests`")
+
+
+def _green_tests_count(r: dict, feature: str) -> int | None:
+    """The executed-test count when ledger record `r` is green tests proof for
+    `feature`'s full-suite check, else None. Two proof kinds, one rule: a proven
+    `prove_run`, or a capture prusik itself recorded (`reviewer_execution_verified`,
+    ok = exit 0 and tests > 0) for THIS feature (fb-6916f692908a)."""
+    if r.get("kind") != "tests":
+        return None
+    if r.get("event") == "prove_run" and r.get("proven"):
+        return int(r.get("executed", 0) or 0)
+    if (r.get("event") == "reviewer_execution_verified" and r.get("ok") is True
+            and r.get("feature") == feature):
+        return int(r.get("nonempty", 0) or 0)
+    return None
+
+
 def _full_suite_gate(current: str, target_phase: str, feature: str) -> int | None:
-    """Full-suite proof check at building exit (field finding #14 v1+v2). Returns 2 to
-    BLOCK (only when `require_full_suite_at_build` is set in sprint-config), else
-    None to proceed (printing an advisory if the full suite wasn't proven). The
-    learned test-count baseline distinguishes a real full-suite proof from a
-    subset of just-the-new-tests."""
+    """Full-suite proof check on leaving `current` (building exit, field finding #14
+    v1+v2, and reviewing→integrating, fb-90cfcfa8b918). Returns 2 to BLOCK (only when
+    `require_full_suite_at_build` is set in sprint-config, or shared test-infra was
+    touched), else None to proceed (printing an advisory if the full suite wasn't
+    proven). Proof is a proven `prove_run` OR a green `prusik gate capture` of this
+    feature (`reviewer_execution_verified`, fb-6916f692908a) recorded this phase. The
+    learned test-count baseline distinguishes a real full-suite proof from a subset
+    of just-the-new-tests."""
     try:
         from prusik import phases as _phases
         from prusik import suite_baseline
@@ -1665,14 +1895,13 @@ def _full_suite_gate(current: str, target_phase: str, feature: str) -> int | Non
         entered = max((r.get("ts", "") for r in records
                        if r.get("event") == "phase_advance"
                        and r.get("to_phase") == current), default="")
-        green = [int(r.get("executed", 0) or 0) for r in records
-                 if r.get("event") == "prove_run" and r.get("kind") == "tests"
-                 and r.get("proven") and r.get("ts", "") >= entered]
+        green = [n for r in records if r.get("ts", "") >= entered
+                 and (n := _green_tests_count(r, feature)) is not None]
         best = max(green) if green else None
         baseline = suite_baseline.load(root)
         if best is None:
-            problem = ("no green `prusik prove --kind tests` recorded this "
-                       "building phase")
+            problem = (f"no green full-suite tests run (`prusik prove` or "
+                       f"`prusik gate capture`) recorded this {current} phase")
         elif not suite_baseline.looks_full(best, baseline):
             problem = (f"the proven run executed {best} test(s) but the full suite "
                        f"is ~{baseline} — looks like a subset, not the full suite")
@@ -1697,8 +1926,7 @@ def _full_suite_gate(current: str, target_phase: str, feature: str) -> int | Non
         print(f"[prusik-gate] BLOCKED leaving '{current}': {problem}. Advancing must "
               f"run on FULL-suite evidence, not a subset — a touched-set green is "
               f"false confidence (fb-90cfcfa8b918). Run the FULL suite green "
-              f"(`prusik prove --kind tests -- <full test command>`) before advancing."
-              f"{trigger}", file=sys.stderr)
+              f"({_FULL_SUITE_REMEDY}) before advancing.{trigger}", file=sys.stderr)
         ledger.append("advance_blocked", from_phase=current, to_phase=target_phase,
                       feature=feature, gate_class=gate_class.FULL_SUITE_NOT_PROVEN,
                       reason=f"full-suite not proven: {problem}"
@@ -1706,7 +1934,8 @@ def _full_suite_gate(current: str, target_phase: str, feature: str) -> int | Non
         return 2
     print(f"[prusik-gate] full-suite ADVISORY — {problem}. A structural change can "
           f"break existing tests outside the touched set; a touched-set green hides "
-          f"them. Prove the FULL suite green before advancing. (Set "
+          f"them. Prove the FULL suite green ({_FULL_SUITE_REMEDY}) before "
+          f"advancing. (Set "
           f"require_full_suite_at_build in sprint-config to hard-block.)")
     return None
 
@@ -1729,6 +1958,7 @@ def ground_truth(args) -> int:
 
 
 def advance(args) -> int:
+    from prusik import consistency
     target_phase = args.phase
     feature = args.feature
     config = phases.load_sprint_config()
@@ -1924,7 +2154,23 @@ def advance(args) -> int:
         ledger.append("phase_advance", from_phase=current, to_phase=target_phase,
                       feature=feature)
         print(f"[prusik-gate] Advanced: {current} → {target_phase}")
+    if current:
+        print(_phase_usage_line(feature, current,
+                                phases.get_phase_spec(config, current) or {}))
     return 0
+
+
+def _phase_usage_line(feature: str, phase: str, phase_spec: dict) -> str:
+    """One advisory line: the measured usage of the phase just left (every visit), against
+    its budget when one is set (fb-a1b7db140a5e). Never blocks the advance."""
+    from prusik import effort, usage
+    u = usage.measure(feature, phase=phase)        # total: never raises
+    if not u.measured:
+        return f"[prusik-gate] {phase} token usage UNMEASURED: {u.reason}"
+    budget = phase_spec.get("budget_tokens")
+    tail = (f" / budget {effort.fmt_tokens(budget)}"
+            + (" — EXCEEDED" if u.tokens > budget else "")) if budget else ""
+    return f"[prusik-gate] {phase} used {effort.fmt_tokens(u.tokens)} tokens{tail}"
 
 
 def mark_fallback(args) -> int:
@@ -2002,23 +2248,52 @@ _DERIVED_DIRS = frozenset({
     "coverage", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 })
 
+# Never descended into by the non-git main-tree walk (VCS metadata, virtualenvs, sprint
+# worktrees) — the fingerprint's cost stays bounded by the project's own source.
+_MAIN_TREE_PRUNE = frozenset({".git", ".hg", ".svn", ".venv", "venv", ".tox", ".nox",
+                              "worktrees"})
 
-def _worktree_substantive_hash(root: Path, extra: tuple[str, ...] = ()) -> str:
-    """Deterministic 16-hex hash of the built-code worktree file-set.
+# The carry-forward marker is the WHOLE verdict line `<token><_CARRY_TAG>…`, written by
+# `_approval_carried_forward` and recognised by `_is_carry_marker` from these SAME two
+# sources (the tag, and the gate tokens in _APPROVAL_SOURCE) — so a reworded marker or a
+# new approval gate can't silently slip past the stale-carry check (fb-3fbf1846ac92). A
+# fresh report whose prose says "(carried forward, not merge-blocking)" is not a marker.
+_CARRY_TAG = " (carried forward — "
+_CARRY_MARKER_RE = re.compile(
+    "^(?:" + "|".join(sorted({re.escape(tok) for _, _, tok in _APPROVAL_SOURCE.values()}))
+    + ")" + re.escape(_CARRY_TAG))
 
-    Code is hashed by raw bytes (whitespace IS significant in code, unlike
-    markdown sections). Fix-4 meta carve-outs are excluded so a rewind that
-    only churns reports/.sprint/etc. does not bust a valid reviewer PASS.
-    Each `extra` project file (e.g. CLAUDE.md) folds in via the
-    section-normalized substantive_hash (it is judged as a doc, not code).
+
+def _is_carry_marker(text: str) -> bool:
+    for line in text.splitlines():
+        if line.strip():
+            return bool(_CARRY_MARKER_RE.match(line.strip()))
+    return False
+
+
+def _judged_skip_prefixes() -> tuple[str, ...]:
+    """Orchestration never part of a reviewer's judged code (one list: consistency's)."""
+    from prusik import consistency as _consistency
+    return _consistency.ORCHESTRATION_PREFIXES + ("scripts/verify/",)
+
+
+def _judged_code_files(root: Path) -> list[tuple[str, bytes]]:
+    """The code a reviewer judged, as (relpath, bytes) — orchestration excluded.
+
+    WORKTREE mode (a builder worktree holds judged files): the worktree file-set, exactly
+    as before. MAIN-TREE mode (worktrees/ absent, empty, or contributing no judged file —
+    every engine self-build): the project's OWN source — git's tracked +
+    untracked-not-ignored files under the project root (also for a project inside a
+    larger repo), else a walk that never enters VCS/virtualenv/derived dirs. Before
+    fb-3fbf1846ac92 main-tree mode collected NOTHING, so every verdict and evidence
+    manifest bound to the hash of empty input and survived any code change.
     """
-    import hashlib as _h
     import os as _os
     from prusik import consistency as _consistency
-    parts: list[str] = []
+    skip = _judged_skip_prefixes()
+    collected: list[tuple[str, bytes]] = []
     wt = root / "worktrees"
     if wt.exists():
-        collected: list[tuple[str, bytes]] = []
         for teammate in sorted(wt.iterdir()):
             if not teammate.is_dir():
                 continue
@@ -2059,26 +2334,75 @@ def _worktree_substantive_hash(root: Path, extra: tuple[str, ...] = ()) -> str:
                 # whole-tree hash (field retro #3). Freshness is scoped to the CODE the
                 # reviewer judged; a reviewer that needs a specific doc folds it in
                 # explicitly via _REVIEWER_INPUTS.
-                if (rel.startswith(".sprint/") or rel.startswith("reports/")
-                        or rel.startswith("scripts/verify/")
-                        or rel.startswith("briefs/")
-                        or rel.startswith("design/")
-                        or rel.startswith(".claude/")):
+                if rel.startswith(skip):
                     continue
                 f = teammate / rel
                 try:
                     collected.append((f"{teammate.name}/{rel}", f.read_bytes()))
                 except OSError:
                     continue
-        for relpath, content in sorted(collected):
-            parts.append(relpath)
-            parts.append(_h.sha256(content).hexdigest())
+    if collected:
+        return collected
+    main_rels = _consistency.git_files_under(root)
+    if main_rels is None:                            # not a git project: walk it
+        main_rels = []
+        for dirpath, dirnames, filenames in _os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in _DERIVED_DIRS and d not in _MAIN_TREE_PRUNE]
+            for fn in filenames:
+                main_rels.append(str((Path(dirpath) / fn).relative_to(root)))
+    for rel in main_rels:
+        if rel.startswith(skip) or rel.startswith("worktrees/"):
+            continue
+        try:
+            collected.append((rel, (root / rel).read_bytes()))
+        except OSError:                              # deleted / a submodule gitlink
+            continue
+    return collected
+
+
+def _worktree_substantive_hash(root: Path, extra: tuple[str, ...] = (),
+                               files: list[tuple[str, bytes]] | None = None) -> str:
+    """Deterministic 16-hex hash of the judged code (`_judged_code_files`).
+
+    Code is hashed by raw bytes (whitespace IS significant in code, unlike
+    markdown sections). Fix-4 meta carve-outs are excluded so a rewind that
+    only churns reports/.sprint/etc. does not bust a valid reviewer PASS.
+    Each `extra` project file (e.g. CLAUDE.md) folds in via the
+    section-normalized substantive_hash (it is judged as a doc, not code).
+    """
+    import hashlib as _h
+    from prusik import schema
+    parts: list[str] = []
+    for relpath, content in sorted(_judged_code_files(root) if files is None else files):
+        parts.append(relpath)
+        parts.append(_h.sha256(content).hexdigest())
     for ex in extra:
         exp = root / ex
         if exp.exists():
             parts.append(ex)
             parts.append(schema.substantive_hash(exp))
     return _h.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _judged_snapshot(root: Path, extra: tuple[str, ...] = ()) -> tuple[str, dict[str, str]]:
+    """One read of the judged tree: `_worktree_substantive_hash` over it, plus a per-path
+    digest (each code file's sha256, each folded-in `extra` doc's substantive_hash) so two
+    snapshots name the paths that differ (fb-97beccfb14a4)."""
+    import hashlib as _h
+    from prusik import schema
+    files = _judged_code_files(root)
+    digests = {rel: _h.sha256(content).hexdigest() for rel, content in files}
+    for ex in extra:
+        if (root / ex).exists():
+            digests[ex] = schema.substantive_hash(root / ex)
+    return _worktree_substantive_hash(root, extra, files), digests
+
+
+def _changed_paths(before: dict[str, str], after: dict[str, str]) -> tuple[str, ...]:
+    """Paths added, removed or rewritten between two `_judged_snapshot` digests."""
+    return tuple(sorted(p for p in before.keys() | after.keys()
+                        if before.get(p) != after.get(p)))
 
 
 def _judged_key(role: str, feature: str, artifact: str | None) -> str:
@@ -2093,8 +2417,14 @@ def _judged_key(role: str, feature: str, artifact: str | None) -> str:
 def _judged_hash(role: str, feature: str, artifact: str | None,
                  root: Path) -> str | None:
     """Substantive hash of what `role` judged, or None if unjudgeable."""
+    from prusik import schema
     if role in _REVIEWER_INPUTS:
-        return _worktree_substantive_hash(root, _REVIEWER_INPUTS[role])
+        # Nothing judged → nothing to bind (fb-3fbf1846ac92): a verdict over zero code
+        # files would match forever. Folded-in docs (`extra`) don't make it judgeable.
+        files = _judged_code_files(root)
+        if not files:
+            return None
+        return _worktree_substantive_hash(root, _REVIEWER_INPUTS[role], files)
     if not artifact:
         return None
     src = root / artifact
@@ -2115,6 +2445,31 @@ def _latest_verdict(role: str, feature: str, key: str) -> dict | None:
     return found
 
 
+def _empty_judged_cause(role: str, root: Path) -> str:
+    """Why a reviewer found nothing to judge — so an empty set is a named cause, never a
+    silently stuck sprint (fb-3fbf1846ac92)."""
+    if role not in _REVIEWER_INPUTS:
+        return ""
+    from prusik import consistency as _consistency
+    listed = _consistency.git_files_under(root)
+    skip = _judged_skip_prefixes()
+
+    def _source_on_disk() -> bool:
+        import os as _os
+        for dirpath, dirnames, filenames in _os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in _MAIN_TREE_PRUNE and d not in _DERIVED_DIRS]
+            for fn in filenames:
+                if not str((Path(dirpath) / fn).relative_to(root)).startswith(skip):
+                    return True
+        return False
+
+    if listed == [] and _source_on_disk():
+        return (f": git lists no files under {root} — is the project gitignored by a "
+                f"parent repo?")
+    return f": no source files found under {root}"
+
+
 def record_verdict(args) -> int:
     """Bind a verdict to the substantive hash of what it judged.
 
@@ -2126,7 +2481,8 @@ def record_verdict(args) -> int:
     h = _judged_hash(args.role, args.feature, args.artifact, root)
     if h is None:
         print(f"[prusik-gate] cannot record verdict — nothing to judge "
-              f"({args.role}, {args.artifact})", file=sys.stderr)
+              f"({args.role}, {args.artifact}){_empty_judged_cause(args.role, root)}",
+              file=sys.stderr)
         return 2
     ledger.append("critic_verdict", role=args.role, feature=args.feature,
                   artifact=key, verdict=args.verdict, content_hash=h)
@@ -2159,9 +2515,60 @@ def verdict_current(args) -> int:
         print(f"[prusik-gate] re-gate needed: {key} changed since pass "
               f"({v.get('content_hash')} → {cur})")
         return 1
+    # The exit gate won't carry over a newer report, so Step 0 mustn't skip the re-run.
+    approval = _approval_path(args.role, args.feature, root)
+    if approval:
+        _, newer = _carryable_verdict(approval, args.feature, root)
+        if newer:
+            print(f"[prusik-gate] re-gate needed: {approval} — {newer}")
+            return 1
     print(f"[prusik-gate] verdict current: {args.role} {v.get('verdict')} {key} "
           f"@ {cur} — carry forward, skip re-dispatch")
     return 0
+
+
+def _report_is_newer(abs_path: Path, token: str, v: dict) -> bool:
+    """True iff the approval file holds a verdict other than `token` (not a carry marker)
+    written AFTER verdict `v` was recorded — newer evidence than the ledger (fb-00c98b8c70c6).
+    A role writes its report before recording, so only an unrecorded report (the reviewer-
+    artifact fallback) is ever newer. No ts → newer: fail closed, the role re-runs."""
+    if not abs_path.exists():
+        return False
+    text = abs_path.read_text()
+    if _verdict_line_ok(text, token) or _is_carry_marker(text):
+        return False
+    from datetime import datetime as _dt
+    try:
+        recorded = _dt.fromisoformat(v["ts"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return True
+    return abs_path.stat().st_mtime > recorded
+
+
+def _carryable_verdict(approval_rel: str, feature: str,
+                       root: Path) -> tuple[str | None, str | None]:
+    """The one carry decision, shared by the exit gate and verdict-current: (marker, None)
+    when `approval_rel`'s latest POSITIVE verdict at the current judged hash carries forward;
+    (None, reason) when a report newer than that verdict blocks it; (None, None) otherwise."""
+    mapping = _APPROVAL_SOURCE.get(Path(approval_rel).name)
+    if not mapping:
+        return None, None
+    role, src_tmpl, token = mapping
+    artifact = src_tmpl.format(feature=feature) if src_tmpl else None
+    cur = _judged_hash(role, feature, artifact, root)
+    if cur is None:
+        return None, None
+    v = _latest_verdict(role, feature, _judged_key(role, feature, artifact))
+    if (not v or v.get("verdict") not in _POSITIVE_VERDICTS
+            or v.get("content_hash") != cur):
+        return None, None
+    if _report_is_newer(root / approval_rel, token, v):
+        return None, (f"this report was written after the last recorded {token} "
+                      f"({role} @ {cur}), so it is newer evidence and is not overwritten "
+                      f"— re-run {role} so its verdict is recorded")
+    src_desc = artifact if artifact else "built code (worktree)"
+    return (f"{token}{_CARRY_TAG}{src_desc} substantively unchanged "
+            f"since {role} verdict @ {cur}; v0.11.0)"), None
 
 
 def _approval_carried_forward(approval_rel: str, feature: str,
@@ -2172,26 +2579,23 @@ def _approval_carried_forward(approval_rel: str, feature: str,
 
     Engine half of the cure: even if a rewind wiped the approval file, a
     still-valid hash-bound verdict in the ledger satisfies the gate without
-    re-dispatching the critic/reviewer.
+    re-dispatching the critic/reviewer. Never over a report newer than that verdict.
     """
-    from pathlib import Path as _P
-    base = _P(approval_rel).name
-    mapping = _APPROVAL_SOURCE.get(base)
-    if not mapping:
-        return None
-    role, src_tmpl, token = mapping
-    artifact = src_tmpl.format(feature=feature) if src_tmpl else None
-    key = _judged_key(role, feature, artifact)
-    cur = _judged_hash(role, feature, artifact, root)
-    if cur is None:
-        return None
-    v = _latest_verdict(role, feature, key)
-    if (not v or v.get("verdict") not in _POSITIVE_VERDICTS
-            or v.get("content_hash") != cur):
-        return None
-    src_desc = artifact if artifact else "built code (worktree)"
-    return (f"{token} (carried forward — {src_desc} substantively unchanged "
-            f"since {role} verdict @ {cur}; v0.11.0)")
+    return _carryable_verdict(approval_rel, feature, root)[0]
+
+
+def _approval_path(role: str, feature: str, root: Path) -> str | None:
+    """`role`'s approval file, as the sprint config's exit artifacts name it (None when no
+    config names one) — so verdict-current reads the same file the exit gate checks."""
+    config = phases.load_sprint_config(root) or {}
+    for spec in config.get("phases") or []:
+        for art in (spec.get("exit_artifacts") or []) + (spec.get("trivial_exit_artifacts")
+                                                          or []):
+            rel = phases.resolve_path(art.get("path", ""), feature=feature)
+            mapping = _APPROVAL_SOURCE.get(Path(rel).name)
+            if mapping and mapping[0] == role:
+                return rel
+    return None
 
 
 # ── v0.12.0 — reviewer execution-evidence (Candidate F) ──────────────────
@@ -2303,7 +2707,15 @@ def _resolve_exec_dir(root: Path) -> Path:
         return root
 
 
-def _wrong_tree_warning(exec_dir: Path, root: Path) -> str | None:
+def _cmd_self_navigates_to_worktree(cmd_str: str) -> bool:
+    """True when the captured command itself `cd`s into a worktree before running —
+    `cd worktrees/<role> && …` (fb-d3adb6e68c43). Then the command exercises the
+    worktree even though capture's own cwd is root, so the wrong-tree warning would be
+    a FALSE alarm (the worktree_hash confirms it measured the worktree, not main)."""
+    return bool(re.search(r"\bcd\s+[\"']?(?:\./)?worktrees/", cmd_str))
+
+
+def _wrong_tree_warning(exec_dir: Path, root: Path, cmd_str: str = "") -> str | None:
     """A loud warning when a WORKTREE-mode sprint captured at the project ROOT —
     the command measured main, not the reviewed worktree code, yet the evidence
     hash stamps the worktree file-set (fb-caff9937144e). Warn, not refuse:
@@ -2315,6 +2727,8 @@ def _wrong_tree_warning(exec_dir: Path, root: Path) -> str | None:
         return None                                  # solo/no-worktree: root is correct
     if exec_dir.resolve() != root.resolve():
         return None                                  # ran inside a worktree (or subdir)
+    if _cmd_self_navigates_to_worktree(cmd_str):
+        return None                                  # the command `cd`s in itself — no false alarm
     return ("[prusik-gate] capture ran at the PROJECT ROOT, but this sprint has "
             "worktrees — if this command was meant to exercise reviewed worktree "
             "code, it just measured main instead (the evidence hash stamps the "
@@ -2425,6 +2839,7 @@ def capture(args) -> int:
                -- <verbatim test/lint command>
     """
     import subprocess
+    from prusik import schema
     root = ledger.project_root()
     cmd = list(args.command or [])
     if cmd and cmd[0] == "--":
@@ -2477,8 +2892,13 @@ def capture(args) -> int:
     # into one) — NOT unconditionally at root — so the command exercises the same
     # code the evidence hash stamps. Warn loudly on the wrong-tree danger.
     exec_dir = _resolve_exec_dir(root)
-    if (wt_warn := _wrong_tree_warning(exec_dir, root)):
+    if (wt_warn := _wrong_tree_warning(exec_dir, root, cmd_str)):
         print(wt_warn, file=sys.stderr)
+    # Snapshot the judged tree BEFORE the run and again after: the evidence is stamped with
+    # the tree it ran against, and a change mid-run is refused below (fb-97beccfb14a4).
+    role = _PHASE_ROLE.get(args.phase, "")
+    extra = _REVIEWER_INPUTS.get(role, ())
+    wt_hash, pre_digests = _judged_snapshot(root, extra)
     try:
         proc = subprocess.run(["/bin/bash", "-c", cmd_str], cwd=str(exec_dir), env=cap_env,
                                capture_output=True, text=True,
@@ -2507,8 +2927,10 @@ def capture(args) -> int:
     # evidence-capture finding cluster (exit-127 fb-53f161606abc, cache-replay an adopter
     # fb-b587d8d9b71c, …).
     from prusik import capture_diagnose
+    changed = _changed_paths(pre_digests, _judged_snapshot(root, extra)[1])
     verdict = capture_diagnose.diagnose(capture_diagnose.CaptureResult(
-        kind=kind, exit_code=exit_code, value=value, output=combined, command=cmd_str))
+        kind=kind, exit_code=exit_code, value=value, output=combined, command=cmd_str,
+        changed_paths=changed))
     if verdict is not None:
         print(f"[prusik-gate] capture: {verdict.remedy}", file=sys.stderr)
         ledger.append("capture_non_evidence", feature=args.feature,
@@ -2521,8 +2943,6 @@ def capture(args) -> int:
         from prusik import suite_baseline
         suite_baseline.update(root, value)
     out_sha = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
-    role = _PHASE_ROLE.get(args.phase, "")
-    wt_hash = _worktree_substantive_hash(root, _REVIEWER_INPUTS.get(role, ()))
 
     try:
         exec_rel = str(exec_dir.resolve().relative_to(root.resolve())) or "."
@@ -2892,14 +3312,19 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
     carry-forward: a verdict carried at the current hash was evidence-
     validated when first recorded — re-requiring it would defeat the
     dominant-cost cure, so a carried paired verdict satisfies."""
+    from prusik import schema
     name = Path(rel_path).name
     phase = name.split(".evidence.json")[0]
     abs_path = root / rel_path
     paired_txt = abs_path.parent / f"{phase}.txt"
 
     # Carry-forward coherence: a carried paired verdict at the current hash
-    # already passed evidence when first recorded (v0.11.0 #1).
-    if paired_txt.exists() and "carried forward" in paired_txt.read_text():
+    # already passed evidence when first recorded (v0.11.0 #1). The marker's TEXT
+    # proves nothing — rewinds leave reports/ on disk, so a marker from an earlier
+    # cycle must still be current (fb-3fbf1846ac92): same check that grants it.
+    if (feature and paired_txt.exists() and _is_carry_marker(paired_txt.read_text())
+            and _approval_carried_forward(str(paired_txt.relative_to(root)), feature,
+                                          root)):
         ledger.append("reviewer_execution_verified", feature=feature,
                        phase=phase, carried=True, ok=True)
         return None
@@ -3043,6 +3468,7 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
 
 
 def brief(args) -> int:
+    from prusik import schema
     ok, errors = schema.validate_brief(args.path)
     if ok:
         print(f"[prusik-gate] brief valid: {args.path}")
@@ -3067,6 +3493,7 @@ def baseline(args) -> int:
 
 
 def scope(args) -> int:
+    from prusik import schema
     ok, errors = schema.validate_scope(args.path, ledger.project_root())
     if ok:
         print(f"[prusik-gate] scope valid: {args.path}")
@@ -3078,6 +3505,7 @@ def scope(args) -> int:
 
 
 def plan(args) -> int:
+    from prusik import schema
     root = ledger.project_root()
     ok, errors = schema.validate_plan(args.path, root)
     if ok:
@@ -3148,6 +3576,7 @@ def verify_reviewer(args) -> int:
     reviewing with unmet exit artifacts. Always exit 0 — informational,
     not blocking.
     """
+    from prusik import consistency
     feature = args.feature
     suspects = consistency.detect_reviewer_fabrication(
         ledger.project_root(), feature
@@ -3183,6 +3612,7 @@ def _feature_drift_terms(feature: str, root) -> list[str]:
     CategoryPicker / useCategories / categorization-types. Short/generic tokens are
     dropped: a MISSED match falls back to the global-% and age floors, but a SPURIOUS
     match would fail a sprint wrongly — so the bar errs toward precision."""
+    from prusik import schema
     tokens = set(re.split(r"[-_/]+", feature.lower()))
     brief = root / "briefs" / f"{feature}.md"
     if brief.exists():
@@ -3197,6 +3627,7 @@ def _feature_drift_terms(feature: str, root) -> list[str]:
 
 def _check_pre_sprint_gates(config: dict, feature: str, root) -> list[str]:
     """Returns a list of unmet gate messages; empty if all pass."""
+    from prusik import discovery
     gates = config.get("pre_sprint_gates", {}) or {}
     unmet: list[str] = []
     for gate_name, gate_spec in gates.items():
@@ -3363,11 +3794,15 @@ def _try_carry_forward(path: str, feature: str | None, root: Path) -> bool:
     marker = _approval_carried_forward(path, feature, root)
     if not marker:
         return False
+    _write_carry_marker(path, marker, feature, root)
+    return True
+
+
+def _write_carry_marker(path: str, marker: str, feature: str, root: Path) -> None:
     abs_path = root / path
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(marker + "\n")
     ledger.append("verdict_carried_forward", feature=feature, approval=path)
-    return True
 
 
 def _cross_artifact_remedy_footer(feature: str | None) -> str:
@@ -3417,6 +3852,7 @@ def _verdict_line_ok(text: str, token: str) -> bool:
 
 
 def _unsatisfied_exit_artifacts(phase_spec: dict, feature: str | None) -> list[str]:
+    from prusik import schema
     root = ledger.project_root()
     missing: list[str] = []
     # v0.11.0 #2: lane-aware exit artifacts. A phase may declare a
@@ -3466,10 +3902,22 @@ def _unsatisfied_exit_artifacts(phase_spec: dict, feature: str | None) -> list[s
             if sec not in abs_path.read_text():
                 missing.append(f"{path} (missing section: {sec})")
         mc = artifact.get("must_contain")
-        if mc and not _verdict_line_ok(abs_path.read_text(), mc):
-            if _try_carry_forward(path, feature, root):
+        text = abs_path.read_text() if mc else ""
+        # A carried-forward marker is a claim about a hash: honoured only while what it
+        # judged is unchanged — a rewind leaves the old marker on disk (fb-3fbf1846ac92).
+        stale_carry = (mc and _is_carry_marker(text) and feature is not None
+                       and _approval_carried_forward(path, feature, root) is None)
+        if stale_carry:
+            missing.append(f"{path} (verdict line must be {mc!r} — its carried-forward "
+                           f"marker is stale: what it judged has changed)")
+        elif mc and not _verdict_line_ok(text, mc):
+            marker, newer = (_carryable_verdict(path, feature, root) if feature
+                             else (None, None))
+            if marker and feature:
+                _write_carry_marker(path, marker, feature, root)
                 continue
-            missing.append(f"{path} (verdict line must be {mc!r})")
+            missing.append(f"{path} (verdict line must be {mc!r}"
+                           f"{f' — {newer}' if newer else ''})")
     return missing
 
 

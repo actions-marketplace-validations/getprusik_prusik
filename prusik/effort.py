@@ -47,12 +47,47 @@ def extract_spans(records: list[dict]) -> list[dict]:
     (labelled with the ledger's `from_phase` — the source of truth) and on
     `sprint_complete`. Returns one dict per closed span:
     `{feature, phase, start, end, seconds, via}` with via ∈ {advance, rewind,
-    complete}. A span whose endpoints don't parse keeps `seconds=None` (it is
-    still listed, just untimed).
+    complete, start} (`start`: the `briefing` span a `sprint_started` closes).
+    A span whose endpoints don't parse keeps `seconds=None` (it is still listed,
+    just untimed).
     """
+    return _walk(records)[0]
+
+
+def phase_windows(records: list[dict], feature: Any) -> list[dict]:
+    """A feature's phase windows `{phase, start, end}` in order — the closed spans plus the
+    still-open current phase (`end=None`). The same walk as `extract_spans`, so time and
+    token attribution (prusik.usage) share one timeline."""
+    spans, open_span = _walk(records)
+    out = [{"phase": s["phase"], "start": s["start"], "end": s["end"]}
+           for s in spans if s["feature"] == feature]
+    if feature in open_span:
+        phase, start = open_span[feature]
+        out.append({"phase": phase, "start": start, "end": None})
+    return out
+
+
+def _walk(records: list[dict]) -> tuple[list[dict], dict[Any, tuple[str, str]]]:
+    """The one timeline walk: (closed spans, still-open {feature: (phase, entry_ts)}).
+
+    A feature's latest `briefing_started` (fb-1e3ecda9d011) is held PENDING, not open: its
+    `sprint_started` consumes it into a closed `briefing` span (via="start"), clipped to start
+    no earlier than the latest closed-span end of any feature so far — so a briefing never
+    overlaps a completed sprint's window and no token is counted twice. A still-open span
+    never clips, and a `briefing_started` with no later `sprint_started` yields nothing."""
     ordered = sorted(records, key=lambda r: r.get("ts", ""))
     open_span: dict[Any, tuple[str, str]] = {}   # feature -> (phase, entry_ts)
     spans: list[dict] = []
+    pending: dict[Any, str] = {}                 # feature -> latest briefing_started ts
+    last_closed: tuple[datetime, str] | None = None   # (parsed end, end string)
+
+    def note_closed(end_ts: str) -> None:
+        nonlocal last_closed
+        e = _parse_ts(end_ts)
+        if e is None:
+            return
+        if last_closed is None or e > last_closed[0]:
+            last_closed = (e, end_ts)
 
     def close(feature: Any, end_ts: str, via: str) -> None:
         cur = open_span.pop(feature, None)
@@ -63,12 +98,27 @@ def extract_spans(records: list[dict]) -> list[dict]:
         seconds = (b - a).total_seconds() if a and b else None
         spans.append({"feature": feature, "phase": phase, "start": start_ts,
                       "end": end_ts, "seconds": seconds, "via": via})
+        note_closed(end_ts)
 
     for r in ordered:
         ev = r.get("event")
         feat = r.get("feature")
         ts = r.get("ts", "")
-        if ev == "sprint_started":
+        if ev == "briefing_started":
+            pending[feat] = ts                   # the latest one wins
+        elif ev == "sprint_started":
+            b = pending.pop(feat, None)          # consume (SC-9): a re-start opens none
+            bd, td = _parse_ts(b), _parse_ts(ts)
+            if b is not None and bd is not None and td is not None:
+                if last_closed is not None and last_closed[0] > bd:
+                    start_dt, start_s = last_closed
+                else:
+                    start_dt, start_s = bd, b
+                if start_dt < td:
+                    spans.append({"feature": feat, "phase": "briefing", "start": start_s,
+                                  "end": ts, "seconds": (td - start_dt).total_seconds(),
+                                  "via": "start"})
+                    note_closed(ts)
             open_span[feat] = (_START_PHASE, ts)
         elif ev in ("phase_advance", "phase_rewind"):
             via = "rewind" if ev == "phase_rewind" else "advance"
@@ -81,7 +131,7 @@ def extract_spans(records: list[dict]) -> list[dict]:
             open_span[feat] = (r.get("to_phase") or "?", ts)
         elif ev == "sprint_complete":
             close(feat, ts, "complete")
-    return spans
+    return spans, open_span
 
 
 def summarize_features(records: list[dict]) -> dict[Any, dict[str, Any]]:
@@ -150,6 +200,16 @@ def summarize_phases(records: list[dict]) -> dict[str, dict[str, Any]]:
     return agg
 
 
+def fmt_tokens(n: int | None) -> str:
+    """Human-readable token count: '850' / '12k' / '3.4M'. Public — composed by gate's
+    advance usage line and `run()` below."""
+    if n is None:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n / 1000:.0f}k" if n >= 1000 else str(n)
+
+
 def fmt_duration(sec: float | None) -> str:
     """Human-readable duration: '45s' / '12m' / '1.5h'. Public — composed by
     the showcase lens (instrument layer)."""
@@ -165,10 +225,12 @@ def run(json_output: bool = False) -> int:
     records = ledger.read_all()
     feats = summarize_features(records)
     phases = summarize_phases(records)
+    from prusik import usage   # function-local: usage imports effort lazily (acyclic)
+    phase_tokens = usage.rollup(records)["by_phase"]
 
     if json_output:
-        print(json.dumps({"features": feats, "by_phase": phases}, indent=2,
-                         default=str))
+        print(json.dumps({"features": feats, "by_phase": phases,
+                          "tokens_by_phase": phase_tokens}, indent=2, default=str))
         return 0
 
     if not feats:
@@ -176,23 +238,27 @@ def run(json_output: bool = False) -> int:
         return 0
 
     print(f"Effort-telemetry — {len(feats)} journeys\n")
-    print(f"  {'feature':24s} {'wall':>6s} {'rwnd':>5s} {'blk':>4s} "
+    print(f"  {'feature':24s} {'wall':>6s} {'tokens':>7s} {'rwnd':>5s} {'blk':>4s} "
           f"{'fix':>4s}  status")
     for feat in sorted(feats, key=lambda k: -(feats[k]["wall_clock_sec"] or 0)):
         d = feats[feat]
         status = "done" if d["complete"] else "open"
         print(f"  {str(feat)[:24]:24s} {fmt_duration(d['wall_clock_sec']):>6s} "
+              f"{fmt_tokens(d['tokens']):>7s} "
               f"{d['rewinds']:5d} {d['blocks']:4d} {d['fix_rounds']:4d}  {status}")
 
     if phases:
         print("\n  where the effort goes (per phase, across all journeys):")
-        print(f"    {'phase':14s} {'total':>7s} {'visits':>7s} {'mean':>7s}")
+        print(f"    {'phase':14s} {'total':>7s} {'visits':>7s} {'mean':>7s} {'tokens':>7s}")
         for ph in sorted(phases, key=lambda k: -phases[k]["total_sec"]):
             a = phases[ph]
             print(f"    {ph:14s} {fmt_duration(a['total_sec']):>7s} "
-                  f"{a['visits']:7d} {fmt_duration(a['mean_sec']):>7s}")
+                  f"{a['visits']:7d} {fmt_duration(a['mean_sec']):>7s} "
+                  f"{fmt_tokens(phase_tokens.get(ph)):>7s}")
 
     print("\nDerived from the append-only ledger (zero hot-path cost). "
           "rwnd=rewinds, blk=writable-gate blocks, fix=fix-rounds. "
+          "tokens = measured from session transcripts at sprint-complete (input + output + "
+          "cache writes + cache reads); set a phase's budget_tokens from these. "
           "Wall-clock includes any pause time.")
     return 0

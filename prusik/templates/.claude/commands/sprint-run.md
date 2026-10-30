@@ -50,6 +50,7 @@ Run the full sprint for feature `$ARGUMENTS` end-to-end. This is the "just ship 
 - Real agents, no substitutes. If a prusik role doesn't resolve via Agent(subagent_type=...), STOP — do not fall back to `general-purpose`.
 - Quality first, then efficiency.
 - Never edit prusik source during a sprint.
+- **Model tier, every spawn:** before each `Agent(...)` call for a prusik role, run `prusik tier resolve <feature-slug> --role <role>`. `<feature-slug>` is the first word of $ARGUMENTS only, never `$ARGUMENTS` itself: `/sprint-start foo --trivial` must give `prusik tier resolve foo --role ...`. On `model=<ref>`, pass `model=<ref>` to that Agent call. On `model=off`, pass no model. On rc ≠ 0, STOP and show the output; do not spawn untiered.
 - No force flags, no destructive ops, no git push/commit unless the user explicitly asks.
 
 ---
@@ -118,6 +119,12 @@ Possible outputs:
     - If the first word isn't a strict PASS/FAIL literal: STOP and tell the user the agent's verdict is unparseable. Do not infer.
 
   Then re-run `prusik gate sprint-init --feature $ARGUMENTS`.
+
+- **"product-fit … soundness is UNJUDGED"** (charter present + `require_critique`; fb-8295dd5d4859) → invoke `product-fit-critic` instead of leaving it for a manual round-trip. First ensure `design/$ARGUMENTS/product-fit.md` exists (`prusik gate product-fit $ARGUMENTS --bootstrap` drafts it), then:
+
+      Agent(subagent_type='product-fit-critic', prompt='review design/$ARGUMENTS/product-fit.md per your role spec and write reports/$ARGUMENTS/product-fit-critique.txt (PASS/FAIL)')
+
+  **Apply the same reviewer artifact fallback** as brief-critic: if the file wasn't written but the agent's first word is a literal `PASS`/`FAIL`, write it from the response, then `prusik gate mark-fallback --role product-fit-critic --feature $ARGUMENTS`. On `FAIL`, the critic names the specific coherence gap (usually an uncited overlapping sibling) — fix `## Related` in product-fit.md, then re-run sprint-init. Sequencing it here collapses the form-pass→manual-critic→re-run round-trip.
 
 - **"map drift Nn% > 30%"** → re-invoke cartographer, then re-run sprint-init.
 
@@ -257,9 +264,9 @@ Invoke `pr-composer`:
 
 ## Step 8 — close out
 
-Capture approximate token count and wall-clock duration for the sprint (from the ledger / your awareness). Then:
+Capture the wall-clock duration for the sprint (from the ledger / your awareness). Token usage is measured by prusik from the session transcripts, so don't estimate it. Then:
 
-    prusik gate sprint-complete --feature $ARGUMENTS --duration-min <N> --tokens <M>
+    prusik gate sprint-complete --feature $ARGUMENTS --duration-min <N>
 
 Finally:
 

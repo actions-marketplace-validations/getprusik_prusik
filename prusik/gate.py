@@ -7,6 +7,7 @@ stdout JSON / exit code to match the Claude Code hook contract.
 
 from __future__ import annotations
 
+import _signal  # type: ignore[import-not-found]  # no stub; `signal` is over the hook budget
 import hashlib
 import json
 import os
@@ -54,10 +55,63 @@ def pre_tool(args=None) -> int:
     event = adapter.parse_event(adapter.read_payload())
     if event is None:
         return 0
+    # A hook that raises exits 1 and one the host kills says nothing, and Claude Code runs the
+    # tool after either, so a call the gate could not judge is refused here (fb-860c63485143).
+    try:
+        reason = _decide_in_time(event)
+    except (Exception, _GateDeadline) as exc:  # noqa: BLE001
+        reason = _gate_fault(event, exc)
+    return adapter.deny(reason) if reason is not None else 0
 
+
+class _GateDeadline(BaseException):
+    """The gate ran out of time. Not an `Exception`, so a guarded step can't swallow it and
+    carry on to an allow."""
+
+
+def _decide_in_time(event) -> str | None:
+    """`_pre_tool_decision` under a deadline, which a timer raises even inside a running regex.
+    A platform with no timer (Windows) has no deadline: there a slow gate still passes the call.
+    `_signal` because `signal` is not on the hook's import budget."""
+    if not hasattr(_signal, "setitimer"):
+        return _pre_tool_decision(event)
+
+    def expired(_signum, _frame):
+        raise _GateDeadline(f"no decision within {_GATE_DEADLINE_SECONDS}s")
+
+    previous = _signal.signal(_signal.SIGALRM, expired)
+    _signal.setitimer(_signal.ITIMER_REAL, _GATE_DEADLINE_SECONDS)
+    try:
+        return _pre_tool_decision(event)
+    finally:
+        _signal.setitimer(_signal.ITIMER_REAL, 0)
+        _signal.signal(_signal.SIGALRM, previous)
+
+
+def _gate_fault(event, exc: BaseException) -> str:
+    """The deny for a call the gate could not judge. The record is best effort: a ledger that
+    can't be written may be the fault, and the deny must not depend on it."""
+    fault = f"{type(exc).__name__}: {exc}"[:200]
+    try:
+        ledger.append("gate_blocked", tool=event.tool, command=event.command,
+                      gate_class=gate_class.GATE_FAULT, reason=f"gate fault: {fault}")
+    except Exception:  # noqa: BLE001
+        pass
+    return (f"[prusik-gate] refused: the gate could not judge this call ({fault}). Nothing ran.\n"
+            "  → a Recursion or Deadline fault is about this command: simplify or split it.\n"
+            "  → a YAML or JSON fault is a damaged .claude/sprint-config.yaml or .sprint/state.json."
+            " Every Edit and Bash call is refused until it parses, so the operator repairs it "
+            "outside this session.\n"
+            "  → anything else is a gate bug: tell the operator, and report it with "
+            "`prusik feedback`.")
+
+
+def _pre_tool_decision(event) -> str | None:
+    """The deny message for this call, or None to allow it. Its own records are already
+    appended."""
     config = phases.load_sprint_config()
     if not config:
-        return 0  # prusik not in this repo; don't interfere
+        return None  # prusik not in this repo; don't interfere
 
     # fb-0b9d0a6d1ce6: single-writer serialization of the SHARED main tree,
     # checked BEFORE the no-active-sprint early return — the colliding session
@@ -79,7 +133,7 @@ def pre_tool(args=None) -> int:
                           gate_class=gate_class.WRITER_LEASE,
                           reason="shared-tree writer lease held by another session",
                           holder=(prior or {}).get("session"))
-            return adapter.deny(main_writer.deny_message(prior or {}))
+            return main_writer.deny_message(prior or {}, event.command or "")
         if action in ("acquired", "stolen_stale"):
             ledger.append(f"writer_lease_{action}", session=event.session,
                           prior_holder=(prior or {}).get("session"))
@@ -89,15 +143,15 @@ def pre_tool(args=None) -> int:
         # No active sprint: the lease above is the only deny on this path, so the write is
         # allowed — a first brief write here opens its briefing window (fb-1e3ecda9d011).
         _record_briefing_for_event(event, None)
-        return 0  # no active sprint
+        return None  # no active sprint
 
     reason = _gate_decision(event, config, state["phase"], state.get("feature"))
     if reason is not None:
-        return adapter.deny(reason)
+        return reason
     # Only a write the gate ALLOWED is recorded: a denied write never happened. Keyed on the
     # policy decision, not the exit code (a host's deny can exit 0).
     _record_briefing_for_event(event, state.get("feature"))
-    return 0
+    return None
 
 
 # ---- briefing window (fb-1e3ecda9d011) ---------------------------------------------------
@@ -215,7 +269,7 @@ def _record_briefing_for_event(event, active_feature: str | None) -> None:
     # other Bash call skips the redirect scan entirely.
     if command and "briefs" in command:
         try:
-            targets += list(_bash_redirect_targets(_strip_heredocs(command)))
+            targets += _event_write_targets(event, _strip_heredocs(command))
         except Exception as exc:  # noqa: BLE001
             briefing_failed("bash_redirect", exc)
     if targets:
@@ -236,14 +290,18 @@ def clear_briefing(slug: str) -> None:
 
 # fb-0b9d0a6d1ce6 — what counts as "mutating the SHARED tree" (vs a worktree,
 # which stays concurrent): a Write/Edit/notebook target outside worktrees/, a
-# bash redirect landing outside worktrees/, or a mutating git statement not
-# explicitly scoped into a worktree (`git -C worktrees/... <cmd>` / a prior
-# `cd worktrees/...` statement in the same command line).
+# bash redirect landing outside worktrees/, or a mutating git command that does not run in a
+# worktree (`git -C worktrees/... <cmd>`, or a `cd worktrees/...` in force).
 _MUTATING_GIT = frozenset((
     "reset", "rebase", "merge", "commit", "push", "checkout", "switch",
     "restore", "stash", "clean", "cherry-pick", "revert", "am", "apply",
     "rm", "mv",
 ))
+_GIT = frozenset(("git",))
+# Git's global flags that take a value: those that say where it runs, then the rest.
+_GIT_DIR_FLAGS = frozenset(("-C", "--git-dir", "--work-tree"))
+_GIT_VALUE_FLAGS = frozenset(("-c", "--namespace", "--config-env", "--attr-source",
+                              "--super-prefix"))
 
 
 def _under_worktrees(target: str) -> bool:
@@ -257,29 +315,12 @@ def _under_worktrees(target: str) -> bool:
     return str(rel).startswith("worktrees/")
 
 
-def _shared_tree_git_mutation(executable: str) -> bool:
-    """True if any statement runs a mutating git subcommand against the shared
-    tree. Statement-ordered: a `cd worktrees/...` earlier in the same command
-    scopes the following statements into that worktree."""
-    in_worktree = False
-    for stmt in re.split(r"(?:;|&&|\|\||\||\n)", executable):
-        toks = stmt.split()
-        if not toks:
-            continue
-        if toks[0] == "cd" and len(toks) > 1:
-            in_worktree = _under_worktrees(toks[1])
-            continue
-        if toks[0] != "git":
-            continue
-        # consume global flags; `-C <path>` scopes this statement explicitly
-        i, stmt_worktree = 1, in_worktree
-        while i < len(toks) and toks[i].startswith("-"):
-            if toks[i] == "-C" and i + 1 < len(toks):
-                stmt_worktree = _under_worktrees(toks[i + 1])
-                i += 2
-                continue
-            i += 2 if toks[i] == "-c" and i + 1 < len(toks) else 1
-        if i < len(toks) and toks[i] in _MUTATING_GIT and not stmt_worktree:
+def _shared_tree_git_mutation(executable: str, start: str = "") -> bool:
+    """True if any command runs a mutating git subcommand against the shared tree, judged from
+    where it runs: `start`, then the `cd` in force, then git's own directory flags."""
+    for argv, cwd in _named_commands(executable, _GIT, start):
+        args, directory = _git_call(argv, cwd)
+        if args and args[0] in _MUTATING_GIT and not _under_worktrees(directory):
             return True
     return False
 
@@ -290,10 +331,10 @@ def _mutates_shared_tree(event) -> bool:
             return True
     if event.command:
         executable = _strip_heredocs(event.command)
-        for target in _bash_redirect_targets(executable):
+        for target in _event_write_targets(event, executable):
             if not _under_worktrees(target):
                 return True
-        if _shared_tree_git_mutation(executable):
+        if _shared_tree_git_mutation(executable, _shell_start(event.cwd)):
             return True
     return False
 
@@ -331,11 +372,10 @@ def _gate_decision(event, config: dict, phase: str, feature) -> str | None:
         executable = _strip_heredocs(cmd)
         phase_spec = phases.get_phase_spec(config, phase) or {}
 
-        # v0.3.8: Bash redirects also write files, and were bypassing the
-        # writable-path check entirely (that check only covered Write/Edit/
-        # NotebookEdit). Scan redirect targets and apply is_path_writable
-        # per target.
-        for target in _bash_redirect_targets(executable):
+        # v0.3.8: Bash also writes files, and was bypassing the writable-path
+        # check entirely (that check only covered Write/Edit/NotebookEdit).
+        # Scan the command's write targets and apply is_path_writable to each.
+        for target in _event_write_targets(event, executable):
             ok, reason = phases.is_path_writable(target, config, phase, feature)
             if not ok:
                 ledger.append("gate_blocked", tool=event.tool, command=cmd,
@@ -343,7 +383,7 @@ def _gate_decision(event, config: dict, phase: str, feature) -> str | None:
                               gate_class=gate_class.WRITABLE_SCOPE,
                               reason=f"bash redirect to unwriteable path: {target} ({reason})")
                 return _writable_scope_deny_msg(
-                    "bash redirect", target, reason, config, phase, feature)
+                    "bash write", target, reason, config, phase, feature)
 
         # Preferred: deny_commands — token-based match. Immune to prose
         # inside heredocs or strings because we check command-position only.
@@ -431,12 +471,18 @@ def _writable_scope_deny_msg(action: str, target: str, reason: str | None, confi
     'don't retry other locations' — so the next write can be valid on the first
     try instead of the fifth. Same `gate_class` (writable_scope), so the rewrite's
     effect is provable by re-running the bounce report."""
+    unresolved = _is_unresolved(target)
+    if unresolved:
+        reason = "the shell expands this target, so the gate can't tell where it lands"
     reason = reason or "outside the phase's writable set"
     lines = [f"[prusik-gate] phase '{phase}' blocks {action} to {target}: {reason}"]
     allowed = phases.writable_patterns(config, phase, feature)
     if allowed:
         shown = ", ".join(allowed[:8]) + (" …" if len(allowed) > 8 else "")
         lines.append(f"  '{phase}' may write ONLY to: {shown}")
+    if unresolved:
+        lines.append("  → name the literal path in the command, or use the Write tool.")
+        return "\n".join(lines)
     hint = _worktree_redirect_hint(target, config, phase, feature)
     if hint:
         lines.append(f"  → {hint}")
@@ -467,54 +513,842 @@ def _worktree_redirect_hint(target: str, config: dict, phase: str,
     return f"Try writing to worktrees/{role_seg}/{rel} instead ({phase} phase)."
 
 
-# Bash shell redirects that WRITE to a target file.
-# Matches: >file  >>file  &>file  2>file  2>>file  1>file
-# Targets can be quoted or bare. We deliberately skip /dev/null etc.
-_REDIRECT_RE = re.compile(
-    r"""(?:^|[\s;&|(])(?:[0-9&]?>>?|&>)\s*("[^"]+"|'[^']+'|[^\s;&|<>()`]+)""",
-    re.MULTILINE,
-)
-_TEE_RE = re.compile(
-    r"""\btee\s+(?:-a\s+)?("[^"]+"|'[^']+'|[^\s;&|<>()`]+)""",
-)
+# Under the host's 15s hook timeout, with room to write the deny.
+_GATE_DEADLINE_SECONDS = 12.0
+# Every operator bash opens a file for writing with, written as bash reads it: no separator
+# is needed before one (`cat> f`). The target is read by `_shell_word`, never by this regex.
+# `>&` with a digit or `-` after it duplicates a descriptor and writes no file.
+_REDIRECT_RE = re.compile(r"&>>?|[0-9]*(?:>>|>\||>&(?![0-9-])|>|<>)")
+# Any redirect that can precede a command word. A descriptor copy takes no word of its own.
+_PREFIX_REDIRECT_RE = re.compile(
+    rf"(?P<copy>[0-9]*[<>]&(?:[0-9]+-?|-)(?=[ \t\\\n;&|]|$))|\{{\w+\}}(?:>>|>|<)"
+    rf"|{_REDIRECT_RE.pattern}|[0-9]*(?:<<<|<<-?|<&|<)")
+_WRITER_RE = re.compile(r"(?<![\w.-])(tee|sed|perl)(?=[ \t\\])")
+# Unlike tee or sed, these words are routine arguments (`git rm`, `pip install`), so each must
+# stand at command position, optionally under a path (`/bin/rm`). The lookbehind holds every
+# character of that path, so a run of them has one start and the scan stays linear.
+_FILE_VERB_RE = re.compile(
+    r"(?<![\w./~-])(?:[\w./~-]*/)?(cp|mv|rm|truncate|dd|touch|install)(?=[ \t\\])")
+_MAX_SUBSCRIPT = 256          # bounds a scan that otherwise runs to the end of the line
+_ENV_WORD_RE = re.compile(rf"[A-Za-z_]\w*(?:\[[^\]\n]{{0,{_MAX_SUBSCRIPT}}}\])?\+?=")
+_STATEMENT_START_RE = re.compile(
+    r"[;&|({]|(?<!\\)\n|(?<![\w-])(?:if|elif|else|while|until|then|do|!)(?=[ \t]|\\\n)")
+_CASE_TOKEN_RE = re.compile(r"(?<![\w.-])(?:case|esac|in)(?![\w.-])|;;&?|;&|[()]")
+_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w$.=/-])(?:(?:export|readonly|local|declare|typeset)[ \t]+)?([A-Za-z_]\w*)(\+?)=")
+_REBINDER_RE = re.compile(
+    r"(?<![\w.-])(?:(?:for|select)[ \t]+(\w+)|(?:read|unset|mapfile|readarray|getopts|printf)"
+    r"[ \t]([^;&|\n]*))")
+# `_shell_word` writes each `$` as one of these, so the quoting that decides what it means
+# survives the quotes coming off. `_expand` turns both back into `$`.
+_LITERAL_DOLLAR = "\x00"       # `'$S'` or `\$S`: no expansion at all
+_QUOTED_DOLLAR = "\x01"        # `"$S"`: expands to one word
+_VARIABLE_RE = re.compile(rf"([${_QUOTED_DOLLAR}])(?:\{{(\w+)\}}|(\w+))")
+_SPLITS_RE = re.compile(r"[\s*?\[]")
+# Text that can rebind a name where this reading can't see it, as the run of `S=` forms below
+# can't cover: code run from a string or a file, and namerefs.
+_OPAQUE_CODE_RE = re.compile(
+    r"(?<![\w.-])(?:eval|source|let)\b|(?:^|[;&|(\n])[ \t]*\.[ \t]"
+    r"|(?<![\w-])(?:declare|typeset|local)[ \t]+-\w*n")
+# Read over literal text too, so `((S=3))`, `$((S=3))`, `${S:=x}` and `"S=x"` all count. A name
+# with more than one hit does not resolve. A false hit only costs a fail-closed target, so a
+# subscript too long to read is a hit.
+_MUTATION_RE = re.compile(
+    rf"(?<!\w)([A-Za-z_]\w*)(?:\[[^\]\n]{{0,{_MAX_SUBSCRIPT}}}\])?[ \t]*(?:[-+*/%:]?=|\+\+|--)"
+    rf"|(?<!\w)([A-Za-z_]\w*)(?=\[[^\]\n]{{{_MAX_SUBSCRIPT + 1}}})")
+_CWD_RE = re.compile(r"[()]|\b(?:cd|pushd|popd)(?:[ \t]+|(?=[;&|)\n]|$))")
+_COMMAND_STARTERS = frozenset(";&|({\n")
+_ESCAPABLE_OPERATORS = frozenset("<>;&|(){")
+_KEYWORD_BEFORE_RE = re.compile(r"(?<![\w-])(?:if|elif|else|while|until|then|do|!)$")
+_EXTGLOB_OPENERS = frozenset("?*+@!$")
+_PIPED_SHELL_RE = re.compile(r"\|\s*(?:xargs\b[^|;&\n]*)?(?:[^\s|;&]*/)?(?:ba|z|k|da)?sh\b")
+_REEXEC_RE = re.compile(rf"(?<![\w:.-])(?:eval|trap)\b|{_PIPED_SHELL_RE.pattern}")
+_ARITHMETIC_RE = re.compile(r"\$?\(\([^;&|()]*\)\)")
+_TEST_RE = re.compile(r"\[\[[^\n]*?\]\]")
+_PARAMETER_RE = re.compile(r"""\$\{[^{}'"`$]*\}""")
+_UNESCAPED_BACKTICK_RE = re.compile(r"(?<!\\)`")
+_INNER_QUOTE_RE = re.compile(r"""(?<!\\)['"`]""")
 _SKIP_TARGETS = {"/dev/null", "/dev/stderr", "/dev/stdout",
                  "/dev/tty", "/dev/zero"}
+_WRITE_HINTS = (">", "tee", "sed", "perl")
+_WORD_END = frozenset(" \t\n;&|<>()")
+# The flags that take a script, and the other flags that take a value, per in-place editor.
+_INPLACE_FLAGS = {"sed": ("ef", ""), "perl": ("eE", "IMmF")}
+# The short and long flags that take a value, per file verb, across BSD and GNU. `-t` is GNU's
+# target directory. A flag read wrongly here can't move `cp`'s destination, the last operand.
+# `install -S` is left out: it takes a suffix on GNU and nothing on BSD, and reading it as a plain
+# flag at worst names one false target, where the other reading could lose the source operand.
+_VERB_VALUE_FLAGS = {"cp": "St", "mv": "St", "rm": "", "truncate": "rs", "touch": "Adrt",
+                     "install": "Bfgmot"}
+_VERB_VALUE_LONG = frozenset(("--date", "--group", "--mode", "--owner", "--reference", "--size",
+                              "--suffix", "--target-directory", "--time"))
+# Commands whose argument is shell code, so what they run is read as well.
+_SHELLS = frozenset(("bash", "sh", "zsh", "ksh", "dash"))
+_CODE_RUNNERS = _SHELLS | {"eval", "trap"}
+_MAX_CODE_DEPTH = 32
+# Targets only the running shell can name. `$` marks them as unresolved.
+_FROM_STDIN = "$(stdin)"
+_FROM_FIND = "$({})"
 
 
-def _bash_redirect_targets(cmd: str) -> list[str]:
-    """Extract file paths that a bash command writes to via redirect or tee.
+def _shell_start(cwd: str | None) -> str:
+    """The host's `cwd` as a landing base: relative to the project root, absolute outside it,
+    and "" at the root or when the host gave none."""
+    if not cwd:
+        return ""
+    path = Path(cwd).resolve()
+    try:
+        rel = path.relative_to(ledger.project_root().resolve())
+    except (ValueError, OSError):
+        return str(path)
+    return "" if rel == Path() else str(rel)
 
-    Called on heredoc-stripped input so we don't pick up redirects that
-    were only in heredoc prose.
 
-    v0.3.11: also strips `-c "..."` / `-c '...'` payloads BEFORE scanning,
-    because inline Python/bash payloads contain `>`, `>=`, `>>` (as
-    comparison operators, regex tokens, etc.) that are NOT shell redirects
-    but that the scanner was mistaking for them. After stripping, a
-    path-likeness filter rejects remaining tokens that start with `=` or
-    `:` or don't look file-shaped, catching any false-positives that
-    survive.
+def _event_write_targets(event, executable: str) -> list[str]:
+    """`_bash_write_targets` from where the event's shell starts. A command naming no writer
+    costs no path resolution."""
+    if not _may_write(executable):
+        return []
+    return _bash_write_targets(executable, _shell_start(getattr(event, "cwd", None)))
+
+
+def _may_write(cmd: str) -> bool:
+    return any(hint in cmd for hint in _WRITE_HINTS) or _FILE_VERB_RE.search(cmd) is not None
+
+
+def _bash_write_targets(cmd: str, start: str = "") -> list[str]:
+    """The files a bash command writes, at the path each lands on, as far as its text says.
+    Relative paths start at `start`, itself relative to the project root.
+
+    Covers redirects, `tee`, the in-place editors `sed -i` and `perl -i`, and the file verbs
+    in `_FILE_VERB_RE`. Called on heredoc-stripped input, so heredoc prose names nothing.
+
+    `-c "..."` payloads go first (v0.3.11): their `>` and `>=` are code, and they stay out of
+    reach. An operator in literal text is not a redirect (fb-48a328898d07); see
+    `_literal_text_mask`. A path-likeness filter drops what survives when the mask gives up.
+
+    `$NAME` resolves when the command itself assigned it; see `_literal_bindings`. Any other
+    target holding a `$` or a backtick comes back unexpanded and fails closed; see
+    `_is_unresolved`. `find -exec`, `xargs` and `sudo` hide a file verb from this reading.
     """
+    if not _may_write(cmd):
+        return []
     cleaned = _strip_c_payloads(cmd)
-    targets: list[str] = []
+    literal = _literal_text_mask(cleaned)
+    labels = _case_labels(cleaned, literal)
+    starts = _command_starts(cleaned, literal, labels)
+    bindings = _literal_bindings(cleaned, literal, starts, labels)
+    cwds = _cwd_scopes(cleaned, literal, start, bindings, labels, starts)
+    named: list[tuple[int, str]] = []
+    verb_files: list[tuple[int, str, str]] = []
     for m in _REDIRECT_RE.finditer(cleaned):
-        tok = m.group(1).strip("\"'")
-        if tok and tok not in _SKIP_TARGETS and _looks_like_file_target(tok):
-            targets.append(tok)
-    for m in _TEE_RE.finditer(cleaned):
-        tok = m.group(1).strip("\"'")
-        if tok and tok not in _SKIP_TARGETS and _looks_like_file_target(tok):
-            targets.append(tok)
+        if not literal[m.start()]:
+            named += [(m.start(), word) for word in _redirect_words(cleaned, m.end())]
+    for m in _WRITER_RE.finditer(cleaned):
+        if not literal[m.start()]:
+            args = _command_args(cleaned, m.end(), literal)
+            files = ([a for a in args if not a.startswith("-")] if m[1] == "tee"
+                     else _inplace_files(m[1], args))
+            named += [(m.start(), f) for f in files]
+    for m in _FILE_VERB_RE.finditer(cleaned):
+        if not literal[m.start()] and m.start() in starts:
+            args = _command_args(cleaned, m.end(), literal)
+            # Expanded first: a value can be a flag, which changes what the operands mean.
+            words = [_expand(a, m.start(), bindings) for a in args]
+            files = _file_verb_targets(m[1], words)
+            split = {w for a, w in zip(args, words)
+                     if _splits_when_used(a, m.start(), bindings)}
+            verb_files += [(m.start(), m[1], f) for f in [*files, *sorted(split - set(files))]]
+    targets: list[str] = []
+    for pos, raw in named:
+        tok = _expand(raw, pos, bindings)
+        if tok not in _SKIP_TARGETS and (_is_unresolved(tok) or _looks_like_file_target(tok)):
+            targets.append(_landing_path(tok, _cwd_at(cwds, pos)))
+    for pos, verb, tok in verb_files:     # an operand is a path, so no path-likeness filter
+        path = _landing_path(tok, _cwd_at(cwds, pos))
+        if tok not in _SKIP_TARGETS and not (verb == "rm" and _is_regenerable(path)):
+            targets.append(path)
+    for pos, body in _backtick_bodies(cleaned):     # the redirects above saw this text
+        found = _bash_write_targets(body, _cwd_at(cwds, pos))
+        targets += [target for target in found if target not in targets]
     return targets
+
+
+def _is_regenerable(path: str) -> bool:
+    """True if `rm` of this normalized path only clears what a tool rebuilds. An unresolved
+    path was not normalized, so its `..` could leave the directory, and it stays a target."""
+    return not _is_unresolved(path) and not _REGENERABLE_DIRS.isdisjoint(path.split("/"))
+
+
+def _command_starts(cmd: str, literal: bytearray, labels: set[int]) -> set[int]:
+    """Where each statement's first word begins, and each word after its `VAR=x` prefixes and
+    redirects. One forward pass, so a separator in literal text splits nothing and a long
+    statement stays linear."""
+    starts: set[int] = set()
+    boundaries = [m.end() for m in _STATEMENT_START_RE.finditer(cmd) if not literal[m.start()]]
+    boundaries += [i + 1 for i in labels if cmd[i] == ")"]
+    for i in [0, *boundaries]:
+        i = _skip_blanks(cmd, i)
+        while i not in starts:
+            starts.add(i)
+            end = None if i >= len(cmd) or literal[i] else _prefix_end(cmd, i)
+            if end is None:
+                break
+            i = _skip_blanks(cmd, end)
+    return starts
+
+
+def _prefix_end(cmd: str, i: int) -> int | None:
+    """The index past the `VAR=x` or redirect at `i`, or None if a command word starts here."""
+    env = _ENV_WORD_RE.match(cmd, i)
+    if env:
+        return env.end() if cmd[env.end():env.end() + 1] in _WORD_END else _shell_word(
+            cmd, env.end())[1]
+    redirect = _PREFIX_REDIRECT_RE.match(cmd, i)
+    if not redirect:
+        return None
+    if redirect["copy"]:
+        return redirect.end()
+    word, end = _shell_word(cmd, redirect.end())
+    return None if word is None else end
+
+
+def _named_commands(cmd: str, names: frozenset[str], start: str = "",
+                    depth: int = 0) -> list[tuple[list[str], str]]:
+    """Each command `cmd` runs under one of `names`, on any path, as (argv, the directory it runs
+    in), its words expanded. Called on heredoc-stripped input. Reads `bash -c`, `eval`, `trap` and
+    backtick bodies too. Only a named command's argv is read, so a line of keywords stays linear.
+
+    A name the command line never set stays unread: `$G push` could be anything, and refusing it
+    would refuse `$PYTHON -m pytest`. The same goes for a substitution before the command word.
+    `sudo`, `env` and the like hide a command from this reading. Code nested past
+    `_MAX_CODE_DEPTH` raises, which `pre_tool` turns into a refusal."""
+    if depth > _MAX_CODE_DEPTH:
+        raise RecursionError(f"shell code nested past {_MAX_CODE_DEPTH} levels")
+    literal = _literal_text_mask(cmd)
+    labels = _case_labels(cmd, literal)
+    starts = _command_starts(cmd, literal, labels)
+    bindings = _literal_bindings(cmd, literal, starts, labels)
+    cwds = _cwd_scopes(cmd, literal, start, bindings, labels, starts)
+    found: list[tuple[list[str], str]] = []
+    for pos in sorted(starts):
+        word = _shell_word(cmd, pos)[0] if cmd[pos:pos + 1] not in ("", "#") else None
+        name = os.path.basename(_expand(word, pos, bindings)) if word else ""
+        if name not in names and name not in _CODE_RUNNERS:
+            continue
+        argv = [_expand(a, pos, bindings) for a in _command_args(cmd, pos, literal)]
+        cwd = _cwd_at(cwds, pos)
+        if name in names:
+            found.append((argv, cwd))
+        code = _shell_code(name, argv)
+        if code:
+            found += _named_commands(_strip_heredocs(code), names, cwd, depth + 1)
+    for pos, body in _backtick_bodies(cmd):
+        found += _named_commands(body, names, _cwd_at(cwds, pos), depth + 1)
+    return found
+
+
+def _shell_code(name: str, argv: list[str]) -> str | None:
+    """The code `argv` hands a shell, if any. A flag holding `c` takes the first word after it
+    that is no flag, as `bash -c -x code` does. A script's own `-c` reads as code too, which only
+    costs a false refusal."""
+    words = argv[1:]
+    if name in ("eval", "trap"):
+        words = words[1:] if words[:1] == ["--"] else words
+        return (" ".join(words) if name == "eval" else next(iter(words), None))
+    for i, arg in enumerate(words):
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg:
+            return next((w for w in words[i + 1:] if not w.startswith(("-", "+"))), None)
+    return None
+
+
+def _backtick_bodies(cmd: str) -> list[tuple[int, str]]:
+    """(position, code) of each backtick span, with one level of escapes off its own nested
+    backticks. A scan of its own, since `_literal_text_mask` stops marking at the first backtick
+    and a quoted backtick after it would shift every pair. `open_quotes` holds each `"` and `$(`
+    still open: a `'` is literal directly in a `"`, and quotes again in a `$(` inside one."""
+    if "`" not in cmd:
+        return []
+    spans: list[tuple[int, str]] = []
+    open_quotes: list[str] = []
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        in_double = open_quotes[-1:] == ['"']
+        if c == "\\":
+            i += 2
+        elif c == "`":
+            end = i + 1
+            while end < n and cmd[end] != "`":
+                end += 2 if cmd[end] == "\\" else 1
+            if end < n:
+                spans.append((i, re.sub(r"\\([`\\$])", r"\1", cmd[i + 1:end])))
+            i = end + 1
+        elif cmd.startswith("$(", i):
+            open_quotes.append("(")
+            i += 2
+        elif c == '"':
+            if in_double:
+                open_quotes.pop()
+            else:
+                open_quotes.append(c)
+            i += 1
+        elif in_double:
+            i += 1
+        elif c == "(":
+            open_quotes.append(c)
+            i += 1
+        elif c == ")":
+            if open_quotes:
+                open_quotes.pop()
+            i += 1
+        elif c == "'":
+            end = cmd.find("'", i + 1)
+            i = n if end < 0 else end + 1
+        elif cmd.startswith("$'", i):
+            i += 2
+            while i < n and cmd[i] != "'":
+                i += 2 if cmd[i] == "\\" else 1
+            i += 1
+        elif c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|("):
+            end = cmd.find("\n", i)
+            i = n if end < 0 else end
+        else:
+            i += 1
+    return spans
+
+
+def _git_call(argv: list[str], cwd: str) -> tuple[list[str], str]:
+    """The words after git's global flags, from a git argv, and the directory it acts on: `cwd`
+    moved by each `-C`, `--git-dir` or `--work-tree`."""
+    directory = cwd
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        flag, has_value, value = argv[i].partition("=")
+        i += 1
+        if flag in _GIT_DIR_FLAGS or flag in _GIT_VALUE_FLAGS:
+            if not has_value:
+                value = argv[i] if i < len(argv) else ""
+                i += 1
+            if flag in _GIT_DIR_FLAGS:
+                directory = _landing_path(value, directory)
+    return argv[i:], directory
+
+
+def _case_labels(cmd: str, literal: bytearray) -> set[int]:
+    """Where each `case` label's own parens sit: the `)` that closes it, and a leading `(`. They
+    open no subshell, and code begins after the `)`. Parens in a label's extglob or `$( )`, and
+    in an arm's code, are not among them."""
+    labels: set[int] = set()
+    if "case" not in cmd:
+        return labels
+    stack: list[str] = []          # one of "subject", "label", "body" per open `case`
+    depth = 0                      # open parens inside the label being read
+    body_start = -1
+    for m in _CASE_TOKEN_RE.finditer(cmd):
+        token, pos = m[0], m.start()
+        if literal[pos]:
+            continue
+        state = stack[-1] if stack else None
+        at_start = pos == body_start or _at_command_position(cmd, pos)
+        if token == "case" and state in (None, "body") and at_start:
+            stack.append("subject")
+        elif state == "subject":
+            if token == "in":
+                stack[-1], depth = "label", 0
+        elif state == "label":
+            if token == "esac" and depth == 0:
+                stack.pop()
+            elif token == ")":
+                if depth:
+                    depth -= 1
+                else:
+                    labels.add(pos)
+                    stack[-1] = "body"
+                    body_start = _skip_blanks(cmd, m.end())
+            elif token == "(":
+                if depth or cmd[pos - 1] in _EXTGLOB_OPENERS:
+                    depth += 1
+                else:
+                    labels.add(pos)
+        elif state == "body":
+            if token.startswith(";"):
+                stack[-1], depth = "label", 0
+            elif token == "esac" and at_start:
+                stack.pop()
+    return labels
+
+
+def _file_verb_targets(verb: str, args: list[str]) -> list[str]:
+    """The paths a file verb changes, from its argv, never a source it only reads. A
+    destination is a directory when its text says so (a trailing `/`, `.`, several sources,
+    `-t`). An existing directory written bare stays a path of its own, and is refused or
+    allowed as one."""
+    if verb == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    operands, target_dir, makes_dirs = _verb_operands(verb, args)
+    if verb in ("rm", "truncate", "touch") or makes_dirs:
+        return operands
+    if target_dir is None:
+        if len(operands) < 2:
+            return []
+        *sources, dest = operands
+    else:
+        sources, dest = operands, target_dir
+    into_dir = (target_dir is not None or len(sources) > 1
+                or dest.endswith(("/", "/.", "/..")) or dest in (".", ".."))
+    landed = ([f"{dest.rstrip('/')}/{os.path.basename(s.rstrip('/'))}" for s in sources]
+              if into_dir else [dest])
+    return sources + landed if verb == "mv" else landed
+
+
+def _verb_operands(verb: str, args: list[str]) -> tuple[list[str], str | None, bool]:
+    """(operands, `-t` directory, `install -d`) from a file verb's argv."""
+    value_flags = _VERB_VALUE_FLAGS[verb]
+    operands: list[str] = []
+    target_dir: str | None = None
+    makes_dirs = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            flag, has_value, value = arg.partition("=")
+            makes_dirs = makes_dirs or (verb == "install" and flag == "--directory")
+            if flag in _VERB_VALUE_LONG:
+                if not has_value:
+                    value = args[i] if i < len(args) else ""
+                    i += 1
+                if flag == "--target-directory":
+                    target_dir = value
+        elif arg.startswith("-") and len(arg) > 1:
+            for j, flag in enumerate(arg[1:], 2):
+                makes_dirs = makes_dirs or (verb == "install" and flag == "d")
+                if flag in value_flags:
+                    value = arg[j:]
+                    if not value:
+                        value = args[i] if i < len(args) else ""
+                        i += 1
+                    if flag == "t":
+                        target_dir = value
+                    break
+        else:
+            operands.append(arg)
+    return operands, target_dir, makes_dirs
+
+
+def _literal_bindings(cmd: str, literal: bytearray, starts: set[int],
+                      labels: set[int]) -> dict[str, tuple[int, str]]:
+    """{name: (position, value)} for each variable the command assigns exactly once, at the
+    top level, so a use after it reads that value. Anything that could leave the name holding
+    another value leaves it out, and its uses fail closed: a second binder (`for`, `read`,
+    `+=`, `unset`), a subshell, a `X=a cmd` prefix, which never reaches the next statement, or
+    any second place the text could change it. Code the gate can't read (`eval`, `source`)
+    leaves every name out.
+
+    An assignment inside `if` or after `&&` counts as taken."""
+    if "=" not in cmd or "$" not in cmd or _OPAQUE_CODE_RE.search(cmd):
+        return {}
+    bound: dict[str, tuple[int, str]] = {}
+    spoiled: set[str] = set()
+    for m in _REBINDER_RE.finditer(cmd):
+        if not literal[m.start()]:
+            spoiled.update(re.findall(r"[A-Za-z_]\w*", m[1] or m[2] or ""))
+    seen: set[str] = set()
+    for m in _MUTATION_RE.finditer(cmd):
+        name = m[1] or m[2]
+        (spoiled if name in seen else seen).add(name)
+    depth = scanned = 0
+    for m in _ASSIGNMENT_RE.finditer(cmd):
+        name = m[1]
+        if literal[m.start()] or m.start() not in starts:
+            continue
+        for pos in range(scanned, m.start()):
+            if cmd[pos] in "()" and not literal[pos] and pos not in labels:
+                depth = max(0, depth + (1 if cmd[pos] == "(" else -1))
+        scanned = m.start()
+        word, end = (("", m.end()) if cmd[m.end():m.end() + 1] in _WORD_END
+                     else _shell_word(cmd, m.end()))
+        after = _skip_blanks(cmd, end)
+        persists = after >= len(cmd) or cmd[after] in ";&|)\n#"
+        if name in bound or name in spoiled or m[2] or not persists or depth > 0:
+            spoiled.add(name)     # `bound` never holds a spoiled name, so no value copies one
+            bound.pop(name, None)
+        else:
+            bound[name] = (m.start(), _expand(word or "", m.start(), bound))
+    return bound
+
+
+def _expand(word: str, pos: int, bindings: dict[str, tuple[int, str]]) -> str:
+    """`word`, as `_shell_word` gave it, with each `$NAME` the command bound before `pos`, and
+    `$HOME`, filled in, and its `$`s plain again. A quoted or escaped `$` stays text. Unquoted,
+    a value bash would split or glob stays unresolved, since it would not be this one word."""
+
+    def fill(m: re.Match) -> str:
+        name = m[2] or m[3]
+        if name == "HOME":
+            return os.path.expanduser("~")
+        found = bindings.get(name)
+        if (found and found[0] < pos
+                and (m[1] == _QUOTED_DOLLAR or not _SPLITS_RE.search(found[1]))):
+            return found[1]
+        return m[0]
+
+    expanded = _VARIABLE_RE.sub(fill, word) if "$" in word or _QUOTED_DOLLAR in word else word
+    return expanded.replace(_LITERAL_DOLLAR, "$").replace(_QUOTED_DOLLAR, "$")
+
+
+def _splits_when_used(word: str, pos: int, bindings: dict[str, tuple[int, str]]) -> bool:
+    """True if `word`, as `_shell_word` gave it, uses unquoted a name bound before `pos` to a
+    value bash would split or glob. Such a word is several words the argv reading can't see."""
+    for m in _VARIABLE_RE.finditer(word):
+        found = bindings.get(m[2] or m[3])
+        if m[1] == "$" and found and found[0] < pos and _SPLITS_RE.search(found[1]):
+            return True
+    return False
+
+
+def _is_unresolved(target: str) -> bool:
+    """True if the shell would expand `target`, so its text is not the path written. Such a
+    target is still checked against the writable set as it stands, which fails closed
+    wherever that set is narrower than everything (fb-7e7454d19bc0)."""
+    return "$" in target or "`" in target
+
+
+def _landing_path(target: str, cwd: str) -> str:
+    """`target` joined onto `cwd`, or as it stands when it is unresolved at its head. A
+    relative path still starts from the project root when no `cd` precedes it."""
+    if target.startswith(("$", "`")):       # may be absolute, so the `cd` can't be kept
+        return target
+    path = os.path.join(cwd, os.path.expanduser(target))
+    return path if _is_unresolved(path) else os.path.normpath(path)
+
+
+def _at_command_position(cmd: str, i: int) -> bool:
+    while i > 0:
+        if cmd[i - 1] in " \t":
+            i -= 1
+        elif cmd[max(0, i - 2):i] == "\\\n":
+            i -= 2
+        else:
+            break
+    if i == 0 or cmd[i - 1] in _COMMAND_STARTERS:
+        return True
+    return _KEYWORD_BEFORE_RE.search(cmd, max(0, i - 6), i) is not None
+
+
+def _cwd_scopes(cmd: str, literal: bytearray, start: str, bindings: dict[str, tuple[int, str]],
+                labels: set[int], starts: set[int]) -> list[tuple[int, str]]:
+    """(position, directory) at each change of the `cd` in force, beginning at `start`. A `cd`
+    inside `( )` or `$( )` ends with it. `pushd` and `popd` move the same way, and a directory
+    they can't name is unresolved."""
+    scopes = [(0, start)]
+    saved: list[str] = []
+    pushed: list[str] = []
+    cwd = start
+    for m in _CWD_RE.finditer(cmd):
+        if literal[m.start()] or m.start() in labels:
+            continue
+        if m[0] == "(":
+            saved.append(cwd)
+        elif m[0] == ")":
+            if not saved:
+                continue
+            cwd = saved.pop()
+        elif m.start() in starts:
+            verb = m[0].strip()
+            word, _end = _shell_word(cmd, m.end())
+            word = _expand(word, m.start(), bindings) if word else word
+            if verb == "popd":
+                cwd = pushed.pop() if pushed else "$OLDPWD"
+            elif word.startswith(("-", "+")) if word else verb == "pushd":
+                cwd = "$OLDPWD"
+            else:
+                if verb == "pushd":
+                    pushed.append(cwd)
+                cwd = _landing_path(word or "~", cwd)
+        else:
+            continue
+        scopes.append((m.start(), cwd))
+    return scopes
+
+
+def _cwd_at(scopes: list[tuple[int, str]], pos: int) -> str:
+    return next(cwd for start, cwd in reversed(scopes) if start <= pos)
+
+
+def _skip_blanks(cmd: str, i: int) -> int:
+    while i < len(cmd):
+        if cmd[i] in " \t":
+            i += 1
+        elif cmd.startswith("\\\n", i):
+            i += 2
+        else:
+            break
+    return i
+
+
+def _shell_word(cmd: str, i: int) -> tuple[str | None, int]:
+    """The word starting at `i` after blanks, as bash reads it, and the index past it. None
+    if no word starts there. Quotes and escapes come off, and each `$` they governed is marked
+    for `_expand`, which every word bound for the gate passes through. An expansion stays as
+    text, which `_is_unresolved` then catches. An empty `""` is a word."""
+    i = start = _skip_blanks(cmd, i)
+    n = len(cmd)
+    out: list[str] = []
+    while i < n and cmd[i] not in _WORD_END:
+        c = cmd[i]
+        if c == "\\":
+            if cmd[i + 1:i + 2] != "\n":
+                out.append(cmd[i + 1:i + 2].replace("$", _LITERAL_DOLLAR))
+            i += 2
+        elif c == "'":
+            end = cmd.find("'", i + 1)
+            end = n if end < 0 else end
+            out.append(cmd[i + 1:end].replace("$", _LITERAL_DOLLAR))
+            i = end + 1
+        elif c == '"':
+            end = _double_quote_end(cmd, i) or n + 1
+            body = re.sub(r'\\(["\\$`])',
+                          lambda m: _LITERAL_DOLLAR if m[1] == "$" else m[1], cmd[i + 1:end - 1])
+            out.append(body.replace("$", _QUOTED_DOLLAR))
+            i = end
+        elif c == "`" or cmd.startswith("$(", i):
+            end = _substitution_end(cmd, i)
+            out.append(cmd[i:end])
+            i = end
+        else:
+            out.append(c)
+            i += 1
+    return ("".join(out), i) if i > start else (None, i)
+
+
+def _redirect_words(cmd: str, i: int) -> list[str]:
+    """The target at `i`, plus its head when a quote or backtick starts inside it. In text a
+    shell runs again, that quote closes the string the redirect sits in (`eval "echo > f"`),
+    so the head is the target. Elsewhere it is one more path to check, and fails closed."""
+    start = _skip_blanks(cmd, i)
+    word, end = _shell_word(cmd, start)
+    if not word:
+        return []
+    inner = _INNER_QUOTE_RE.search(cmd, start + 1, end)
+    head = _shell_word(cmd[start:inner.start()], 0)[0] if inner else None
+    if head and cmd.count("`", start, end) % 2:     # a backtick this word never closes
+        return [head]
+    return [word, head] if head else [word]
+
+
+def _substitution_end(cmd: str, start: int) -> int:
+    """Index just past the `$(...)` or backtick span at `start`, or the command's end. Quotes
+    inside `$(...)` are skipped, so a `)` in them closes nothing."""
+    if cmd[start] == "`":
+        end = cmd.find("`", start + 1)
+        return len(cmd) if end < 0 else end + 1
+    depth, i, n = 1, start + 2, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            end = cmd.find("'", i + 1)
+            i = n if end < 0 else end + 1
+            continue
+        if c == '"':
+            i = _double_quote_end(cmd, i) or n
+            continue
+        depth += (c == "(") - (c == ")")
+        i += 1
+        if depth == 0:
+            return i
+    return n
+
+
+def _command_args(cmd: str, i: int, literal: bytearray) -> list[str]:
+    """The words of the command from `i` to the end of its statement, leaving out redirects
+    and the descriptor number before one."""
+    args: list[str] = []
+    while True:
+        i = _skip_blanks(cmd, i)
+        if i >= len(cmd) or cmd[i] in ";&|()\n" or (cmd[i] == "#" and literal[i]):
+            return args
+        if cmd.startswith(("<(", ">("), i):         # a process substitution is an argument
+            i = _substitution_end(cmd, i)
+            continue
+        if cmd[i] in "<>":
+            m = _REDIRECT_RE.match(cmd, i)
+            i = m.end() if m else i + 1
+            _word, i = _shell_word(cmd, i)
+            continue
+        word, end = _shell_word(cmd, i)
+        if word is None:
+            return args
+        if not (word.isdigit() and cmd[end:end + 1] in ("<", ">")):
+            args.append(word)
+        i = end
+
+
+def _inplace_files(editor: str, args: list[str]) -> list[str]:
+    """The files `sed` or `perl` edits in place, from its argv, or [] with no `-i`. Without
+    `-e` or `-f` the first operand is the script. `-i` takes a suffix only when attached,
+    and BSD's separate `-i ''` is the one spaced form (`perl -pie` means suffix `e`)."""
+    script_flags, value_flags = _INPLACE_FLAGS[editor]
+    inplace = script = False
+    operands: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            flag, has_value, _value = arg.partition("=")
+            inplace = inplace or flag == "--in-place"
+            if flag in ("--expression", "--file"):
+                script = True
+                i += 0 if has_value else 1
+        elif arg.startswith("-") and len(arg) > 1:
+            for j, flag in enumerate(arg[1:], 2):
+                attached = arg[j:]
+                if flag == "i":
+                    inplace = True
+                    if not attached and args[i:i + 1] == [""]:
+                        i += 1
+                    break
+                if flag in script_flags or flag in value_flags:
+                    script = script or flag in script_flags
+                    i += 0 if attached else 1
+                    break
+        else:
+            operands.append(arg)
+    if not inplace:
+        return []
+    files = operands if script else operands[1:]
+    if "{}" in files:
+        return [_FROM_FIND]
+    return files or [_FROM_STDIN]
+
+
+def _literal_text_mask(cmd: str) -> bytearray:
+    """1 at every position bash reads as literal text: quotes, escaped operators, comments,
+    arithmetic and `[[ ]]`, where `>` compares.
+
+    `$(...)` in double quotes is code again, so it is read by the same rules. The gate must
+    never lose a real redirect, so where this can't be sure it stops marking and the rest
+    of the command scans as code. That covers a backtick in double quotes, which runs a
+    command and can nest quotes; a complex `${`, `$'` and a bare backtick, whose quoting
+    rules differ; an unterminated quote; and text a shell runs again, such as `eval`,
+    `trap` or `| sh`. A false block costs a turn, and a missed
+    redirect is a write the gate never sees. Indirection (`$cmd "..."`) and a script
+    written then sourced are out of reach, as `bash -c` payloads are for the write check.
+    `_named_commands` does read those.
+    """
+    mask = _quoted_text_mask(cmd)
+    if any(not mask[m.start()] for m in _REEXEC_RE.finditer(cmd)):
+        return bytearray(len(cmd))
+    return mask
+
+
+def _quoted_text_mask(cmd: str) -> bytearray:
+    """The mask before any re-execution check: the same marks, with `eval` read as a word."""
+    mask = bytearray(len(cmd))
+    i, n = 0, len(cmd)
+    word_start = True
+    while i < n:
+        c = cmd[i]
+        at_word_start, word_start = word_start, c in " \t\n"
+        if c == "\\":
+            # Skipped so `\'` opens no quote. Only an operator is masked: `\tee` still runs tee.
+            if cmd[i + 1:i + 2] in _ESCAPABLE_OPERATORS:
+                mask[i + 1] = 1
+            i += 2
+            continue
+        if c == "`" or cmd.startswith("$'", i):
+            return mask
+        compare = None
+        if c == "$" or (at_word_start and c == "("):
+            compare = _ARITHMETIC_RE.match(cmd, i)
+        elif at_word_start and cmd.startswith("[[", i) and _at_command_position(cmd, i):
+            compare = _TEST_RE.match(cmd, i)
+        if compare:
+            mask[i:compare.end()] = b"\x01" * (compare.end() - i)
+            i = compare.end()
+            continue
+        if cmd.startswith("${", i):
+            param = _PARAMETER_RE.match(cmd, i)
+            if not param:
+                return mask
+            mask[i:param.end()] = b"\x01" * (param.end() - i)
+            i = param.end()
+            continue
+        if c == "'":
+            end = cmd.find("'", i + 1) + 1
+        elif c == '"':
+            end = _double_quote_end(cmd, i)
+            if end and _UNESCAPED_BACKTICK_RE.search(cmd, i, end):
+                return mask
+            if end:
+                _mask_double_quotes(cmd, i, end, mask)
+                i = end
+                continue
+        elif c == "#" and at_word_start:
+            newline = cmd.find("\n", i)
+            end = newline if newline >= 0 else n
+        else:
+            i += 1
+            continue
+        if not end:                               # unterminated quote
+            return mask
+        mask[i:end] = b"\x01" * (end - i)
+        i = end
+    return mask
+
+
+def _mask_double_quotes(cmd: str, start: int, end: int, mask: bytearray) -> None:
+    """Mark the double-quoted span, leaving each `$(...)` in it masked as the code it is."""
+    mask[start:end] = b"\x01" * (end - start)
+    i = start + 1
+    while i < end - 1:
+        if cmd[i] == "\\":
+            i += 2
+        elif arithmetic := _ARITHMETIC_RE.match(cmd, i):
+            i = arithmetic.end()
+        elif cmd.startswith("$(", i):
+            stop = _substitution_end(cmd, i)
+            mask[i:stop] = bytes(stop - i)
+            mask[i + 2:stop - 1] = _literal_text_mask(cmd[i + 2:stop - 1])
+            i = stop
+        else:
+            i += 1
+
+
+def _double_quote_end(cmd: str, start: int) -> int:
+    """Index just past the `"` closing the one at `start`, or 0 if it never closes. A `$(`
+    opens its own quoting, so a `"` inside one closes nothing here."""
+    i = start + 1
+    while i < len(cmd):
+        if cmd[i] == "\\":
+            i += 2
+        elif cmd[i] == '"':
+            return i + 1
+        elif cmd.startswith("$(", i):
+            i = _substitution_end(cmd, i)
+        else:
+            i += 1
+    return 0
 
 
 # Strip `python -c "<program>"` / `bash -c '<script>'` / `sh -c "..."` etc.
 # The embedded program is not shell — it won't be parsed for redirects.
 _C_PAYLOAD_RE = re.compile(
     r"""(?:python[23]?|bash|sh|zsh|ksh|uv\s+run\s+python[23]?|uv\s+run)\s+
-        (?:[^'"\s<>;&|()`]+\s+)*           # any flags before -c
+        (?:[^'"\s<>;&|()`]+\s+){0,32}      # any flags before -c, bounded to stay linear
         -c\s+
-        (?:"[^"]*"|'[^']*')                # the payload itself (quoted)
+        (?:"(?:[^"\\]|\\.)*"|'[^']*')        # the payload itself (quoted)
     """,
     re.VERBOSE,
 )
@@ -550,36 +1384,36 @@ def _looks_like_file_target(tok: str) -> bool:
     # Has a file extension — accept (handles quoted paths with spaces)
     if re.search(r"\.[a-zA-Z0-9]+$", tok):
         return True
-    # Bare word without extension (e.g. `tee logfile`) — conservative accept
-    if re.match(r"^[a-zA-Z_][\w\-]*$", tok):
+    # Bare word without extension (e.g. `tee logfile`, or a quoted `my file`) — conservative
+    # accept
+    if re.match(r"^[a-zA-Z_][\w\- ]*$", tok):
         return True
     return False
 
 
 def _command_denied(cmd: str, denied: str) -> bool:
-    """True if any shell statement in cmd begins with the denied command tokens.
-
-    Tokenizes cmd into statements (split on ; && || | \\n) and matches the
-    denied tokens as a prefix of each statement's word list. Safe against
-    prose inside heredocs (already stripped) or inside quoted strings
-    (those end up as single tokens that don't match naked word prefixes).
+    """True if `cmd` runs a command whose words begin with the denied words, on any path and
+    past git's global flags. See `_named_commands` for where a command is read. Quoted text and
+    comments are no command, and heredoc prose is already stripped.
 
     Examples, with denied = "git push":
       "git push origin main"      → True
-      "echo 'git push'"           → False (echo is command, 'git push' is a quoted arg)
-      "git status && git push"    → True (second statement matches)
-      "git   push main"           → True (multiple spaces collapse in split)
+      "echo 'git push'"           → False (a quoted argument)
+      "git status && git push"    → True
+      "(git -C . push)"           → True
     """
-    denied_tokens = denied.split()
-    if not denied_tokens:
+    words = denied.split()
+    if not words:
         return False
-    # Shell statement separators
-    statements = re.split(r"(?:;|&&|\|\||\||\n)", cmd)
-    for stmt in statements:
-        tokens = stmt.split()
-        if len(tokens) >= len(denied_tokens) and tokens[:len(denied_tokens)] == denied_tokens:
-            return True
-    return False
+    name = os.path.basename(words[0])
+    return any(_invokes(argv, words) for argv, _ in _named_commands(cmd, frozenset((name,))))
+
+
+def _invokes(argv: list[str], words: list[str]) -> bool:
+    """True if `argv` begins with `words`, its command on any path and past git's global flags."""
+    head = words[0] if os.path.basename(argv[0]) == words[0] else argv[0]
+    rest = _git_call(argv, "")[0] if head == "git" else argv[1:]
+    return [head, *rest][:len(words)] == words
 
 
 def is_command_denied(cmd: str, phase_spec: dict) -> bool:
@@ -589,22 +1423,102 @@ def is_command_denied(cmd: str, phase_spec: dict) -> bool:
     return any(_command_denied(cmd, d) for d in phase_spec.get("deny_commands", []))
 
 
-_HEREDOC_RE = re.compile(
-    # Match `<<[-]?[']DELIM[']` then any chars, then ^DELIM$ on its own line.
-    r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?^\s*\1\s*$",
-    re.MULTILINE | re.DOTALL,
-)
+_HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(-?)(?!<)")
+_LINE_END_RE = re.compile(r"(?<!\\)\n")
 
 
-def _strip_heredocs(cmd: str) -> str:
-    """Remove heredoc bodies from a shell command before pattern matching.
+def _strip_heredocs(cmd: str, depth: int = 0) -> str:
+    """Take out what bash treats as heredoc data, before anything reads `cmd` as commands.
 
-    Heredoc bodies are shell *data*, not *commands* — the shell does not
-    execute words inside them. Prose like "discuss git merge semantics"
-    appearing in a heredoc (e.g. when appending to a log file via
-    `cat <<EOF`) must not trip deny_bash patterns.
+    Prose in a body must not trip a check, but only what bash leaves unrun is data. So `<<` opens
+    a body only where `_quoted_text_mask` leaves it as code, an unquoted body keeps its
+    substitutions, and a body a shell reads stays. That mask, since the re-execution check in
+    `_literal_text_mask` would turn quoted text back into operators.
+
+    A body's quotes would shift how the text after it reads, so the mask is taken again after each
+    line of operators, and text before the first operator is never read from a body. A heredoc
+    with no closing line stays, and scans as code. Heredocs nested past `_MAX_CODE_DEPTH` raise,
+    which `pre_tool` turns into a refusal.
     """
-    return _HEREDOC_RE.sub("", cmd)
+    if depth > _MAX_CODE_DEPTH:
+        raise RecursionError(f"heredocs nested past {_MAX_CODE_DEPTH} levels")
+    start = 0
+    while cmd.find("<<", start) >= 0:
+        literal = _quoted_text_mask(cmd)
+        operators = [m for m in _HEREDOC_OPERATOR_RE.finditer(cmd, start)
+                     if not literal[m.start()] and not literal[m.start() + 1]]
+        line_end = next((m.start() for m in _LINE_END_RE.finditer(cmd, operators[0].end())
+                         if not literal[m.start()]), -1) if operators else -1
+        if line_end < 0:
+            return cmd
+        on_line = [m for m in operators if m.start() < line_end]
+        cmd, start = _take_bodies(cmd, on_line, line_end, literal, depth)
+    return cmd
+
+
+def _take_bodies(cmd: str, operators: list[re.Match[str]], line_end: int, literal: bytearray,
+                 depth: int) -> tuple[str, int]:
+    """`cmd` with `operators`, all on the line ending at `line_end`, and their bodies taken out,
+    and the index to go on from. Bodies follow the line in order, and what a body leaves goes back
+    after the line, where it is no argument of the command and an operator on this line can't
+    take it for its own body. Its own heredocs are stripped apart from the rest, since one can't
+    close past the body that holds it, and a substitution runs before a shell reads the body."""
+    starts = _command_starts(cmd, literal, _case_labels(cmd, literal))
+    line: list[str] = []
+    kept: list[str] = []
+    copied, body_start = operators[0].start(), line_end + 1
+    line.append(cmd[:copied])
+    for operator in operators:
+        word, word_end = _shell_word(cmd, operator.end())
+        indent = r"\t*" if operator[1] else ""
+        closing = None if word is None else re.compile(
+            rf"^{indent}{re.escape(word)}$", re.MULTILINE).search(cmd, body_start)
+        if not closing:
+            break
+        line.append(cmd[copied:operator.start()])
+        copied = word_end
+        body = cmd[body_start:closing.start()]
+        delimiter = cmd[operator.end():word_end].replace("\\\n", "")
+        if not set(delimiter) & set("'\"\\"):
+            kept += [_strip_heredocs(f"{span}\n", depth + 1) for span in _substitutions(body)]
+        if _shell_reads_body(cmd, operator.start(), line_end, starts, literal):
+            kept.append(_strip_heredocs(body, depth + 1))
+        body_start = closing.end() + 1
+    if body_start == line_end + 1:
+        return cmd, body_start
+    head = "".join(line) + cmd[copied:line_end + 1] + "".join(kept)
+    return head + cmd[body_start:], len(head)
+
+
+def _shell_reads_body(cmd: str, operator: int, line_end: int, starts: set[int],
+                      literal: bytearray) -> bool:
+    """True if the heredoc at `operator` may feed a shell: its own command is one, or a pipe to one
+    follows on the line. This errs towards code, as telling `bash script.sh <<EOF` or
+    `cat <<EOF; x | sh` apart means parsing flags and groups, and a false refusal costs a turn."""
+    if any(not literal[m.start()] for m in _PIPED_SHELL_RE.finditer(cmd, operator, line_end)):
+        return True
+    pos = max((s for s in starts if s <= operator), default=0)
+    while (end := _prefix_end(cmd, pos)) is not None:
+        pos = _skip_blanks(cmd, end)
+    word = _shell_word(cmd, pos)[0]
+    return word is not None and os.path.basename(word) in _SHELLS
+
+
+def _substitutions(body: str) -> list[str]:
+    """Each `$(...)` and backtick span in an unquoted heredoc body. Quotes are plain text there,
+    and a backslash is what keeps one from running."""
+    spans: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        if body[i] == "\\" or body.startswith("$$", i):
+            i += 2
+        elif body[i] == "`" or body.startswith("$(", i):
+            end = _substitution_end(body, i)
+            spans.append(body[i:end])
+            i = end
+        else:
+            i += 1
+    return spans
 
 
 def stop(args=None) -> int:
@@ -1035,8 +1949,10 @@ def sprint_init(args) -> int:
         print(f"[prusik-sprint-init] reports/{feature}/brief-critique.txt missing.")
         print()
         print("Next:")
-        print(f"  1. Invoke brief-critic via Agent(subagent_type='brief-critic') on briefs/{feature}.md.")
-        print(f"  2. Re-run: prusik gate sprint-init --feature {feature}")
+        print(f"  1. Run `prusik gate brief {feature}`. On rc≠0, fix the brief first.")
+        print("  2. Invoke brief-critic via Agent(subagent_type='brief-critic') on "
+              f"briefs/{feature}.md, with that output in its prompt.")
+        print(f"  3. Re-run: prusik gate sprint-init --feature {feature}")
         return 1
 
     # 6. v0.5.9: permissions baseline must be present. Hard-blocks team-mode
@@ -1103,6 +2019,7 @@ def sprint_start(args) -> int:
     _prior_feature = _prior.get("feature")
     _prior_phase = _prior.get("phase")
     _paused = _pause.is_paused(root)
+    _discard: list[str] | None = None
     if (_prior_feature and _prior_feature != feature
             and (_paused or _prior_phase in _PROTECTED_PHASES)):
         wt = root / "worktrees"
@@ -1123,12 +2040,9 @@ def sprint_start(args) -> int:
                           prior_feature=_prior_feature, prior_phase=_prior_phase,
                           paused=_paused, worktrees=_live)
             return 2
-        # Explicit opt-out: discard the other sprint cleanly, incl. its stale
-        # pause marker, then fall through to the normal (destructive) start.
-        if _paused:
-            _pause.resume()
-        print(f"[prusik-gate] --force-clean: discarding sprint {_prior_feature!r} "
-              f"and its {len(_live)} worktree(s).")
+        # Explicit opt-out: the discard itself waits until every refusal below has
+        # passed, so a refused start leaves the other sprint untouched (fb-3adb150c6991).
+        _discard = _live
 
     brief_path = root / "briefs" / f"{feature}.md"
     if not brief_path.exists():
@@ -1164,6 +2078,33 @@ def sprint_start(args) -> int:
                       gate_class=gate_class.SPRINT_START_GATE)
         return 2
 
+    # v0.11.0 #2 — proportional-ceremony (trivial) lane. Ceremony
+    # proportional to blast radius IS prusik's stated value; a guarded,
+    # near-zero-blast-radius change earning near-zero design ceremony is
+    # that principle applied, not a loophole. The guard is ungameable: the
+    # brief's Type must be one a one-shot change can plausibly be. Decided
+    # HERE (sprint-start) not at triage — triage runs AFTER scoping, too
+    # late to skip the scope-critic ceremony that is the actual cost.
+    if getattr(args, "trivial", False):
+        btype = schema.extract_enum_value(
+            schema.parse_sections(brief_path.read_text()).get("## Type", "")) or ""
+        if btype not in _TRIVIAL_ELIGIBLE_TYPES:
+            print(f"[prusik-gate] --trivial rejected: brief Type is {btype!r}; the "
+                  f"trivial lane is only for {sorted(_TRIVIAL_ELIGIBLE_TYPES)}.",
+                  file=sys.stderr)
+            print("  A new_feature/refactor/migration has real blast radius — "
+                  "run without --trivial (full scope/plan review).",
+                  file=sys.stderr)
+            ledger.append("trivial_lane_rejected", feature=feature, brief_type=btype)
+            return 2
+
+    # Every refusal is above this line; everything below changes state.
+    if _discard is not None:
+        if _paused:
+            _pause.resume()
+        print(f"[prusik-gate] --force-clean: discarding sprint {_prior_feature!r} "
+              f"and its {len(_discard)} worktree(s).")
+
     # v0.3.9: wipe stale worktrees before the sprint begins. Worktrees are
     # per-sprint ephemeral scratch space; contamination from a prior sprint
     # leaks into the current sprint's touch-list and confuses reviewers
@@ -1186,13 +2127,6 @@ def sprint_start(args) -> int:
         print(f"[prusik-gate] Reaped orphaned fix-round from "
               f"{_reaped.get('feature')!r} before starting {feature!r}.")
 
-    # v0.11.0 #2 — proportional-ceremony (trivial) lane. Ceremony
-    # proportional to blast radius IS prusik's stated value; a guarded,
-    # near-zero-blast-radius change earning near-zero design ceremony is
-    # that principle applied, not a loophole. The guard is ungameable: the
-    # brief's Type must be one a one-shot change can plausibly be. Decided
-    # HERE (sprint-start) not at triage — triage runs AFTER scoping, too
-    # late to skip the scope-critic ceremony that is the actual cost.
     state: dict = {"phase": "scoping", "feature": feature}
     # Record the base commit so a completing sprint can diff EXACTLY what it changed,
     # independent of push state (fb-e340cd203897: the ci-deliverable-observation check
@@ -1202,17 +2136,6 @@ def sprint_start(args) -> int:
     if _base:
         state["base_commit"] = _base
     if getattr(args, "trivial", False):
-        btype = schema.parse_sections(brief_path.read_text()).get("## Type", "")
-        btype = (btype.strip().split() or [""])[0].strip("`*_").rstrip(",.")
-        if btype not in _TRIVIAL_ELIGIBLE_TYPES:
-            print(f"[prusik-gate] --trivial rejected: brief Type is {btype!r}; the "
-                  f"trivial lane is only for {sorted(_TRIVIAL_ELIGIBLE_TYPES)}.",
-                  file=sys.stderr)
-            print("  A new_feature/refactor/migration has real blast radius — "
-                  "run without --trivial (full scope/plan review).",
-                  file=sys.stderr)
-            ledger.append("trivial_lane_rejected", feature=feature, brief_type=btype)
-            return 2
         state["lane"] = "trivial"
 
     phases.set_sprint_state(state)
@@ -1651,6 +2574,38 @@ def release_writer(args) -> int:
     return 0
 
 
+def _close_gate(feature: str, phase: str | None) -> int | None:
+    """The exit check on the last phase (fb-a959d1f48f12). Advance checks every other
+    phase's exit artifacts, and nothing advances out of the last one, so a sprint leaves it
+    here. Returns the rc that refuses the close, or None to proceed. A close from an
+    earlier phase is refused rather than judged on that phase's artifacts: `reviewing` can
+    be fully satisfied with no retro, and leaving it here would skip the last phase whole."""
+    config = phases.load_sprint_config() or {}
+    names = [p["name"] for p in config.get("phases", [])]
+    if not names:
+        print("No sprint-config.yaml phases found. Run 'prusik init' first.", file=sys.stderr)
+        return 1
+    last = names[-1]
+    if phase != last:
+        print(f"[prusik-gate] Cannot close '{feature}' from phase '{phase}': a sprint closes "
+              f"from its last phase, '{last}'. Advance to it, then retry.", file=sys.stderr)
+        ledger.append("advance_blocked", from_phase=phase, to_phase="sprint_complete",
+                      feature=feature, gate_class=gate_class.CLOSE_BEFORE_LAST_PHASE,
+                      reason=f"close before last phase: {phase} (last is {last})")
+        return 2
+    missing = _unsatisfied_exit_artifacts(phases.get_phase_spec(config, last) or {}, feature)
+    if missing:
+        print(f"[prusik-gate] Cannot close '{feature}': unmet exit artifacts:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        print("Produce them, then retry. The sprint stays open.", file=sys.stderr)
+        ledger.append("advance_blocked", from_phase=phase, to_phase="sprint_complete",
+                      feature=feature, gate_class=gate_class.UNMET_EXIT_ARTIFACTS,
+                      missing=missing)
+        return 2
+    return None
+
+
 def sprint_complete(args) -> int:
     """Close the sprint: record predicted-vs-actual and clear state."""
     feature = args.feature
@@ -1660,6 +2615,10 @@ def sprint_complete(args) -> int:
         print(f"[prusik-gate] No active sprint for feature '{feature}' "
               f"(current state: {state})", file=sys.stderr)
         return 1
+
+    refused = _close_gate(feature, state.get("phase"))
+    if refused is not None:
+        return refused
 
     # v0.9.0 — verify each declared success criterion before recording
     # sprint_complete. If any criterion FAILED, refuse the close. The
@@ -2051,6 +3010,12 @@ def advance(args) -> int:
 
         inconsistencies = consistency.run_for_phase(current, ledger.project_root(), feature)
 
+        if current == "scoping":
+            for flag in consistency.brief_type_matches_scope(ledger.project_root(), feature):
+                print(f"[prusik-gate] ⚠ {flag}")
+                ledger.append("size_type_flag", from_phase=current, feature=feature,
+                              detail=flag)
+
         # v0.10.0 (Fix 1): observability of the eliminated hand-list rot.
         # Emitted on building/solo_execute exit when the hand-list actually
         # drifted from scope — proving the cure (drift existed but did NOT
@@ -2247,6 +3212,10 @@ _DERIVED_DIRS = frozenset({
     "node_modules", "dist", ".next", ".nuxt", ".turbo", ".svelte-kit",
     "coverage", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 })
+# What `rm` may clear in any phase: the same names, plus virtualenvs, which the hash prunes
+# for a different reason. The gate blocks advancing with caches left behind, so the cleanup
+# it demands must never be refused.
+_REGENERABLE_DIRS = _DERIVED_DIRS | {".venv", "venv"}
 
 # Never descended into by the non-git main-tree walk (VCS metadata, virtualenvs, sprint
 # worktrees) — the fingerprint's cost stays bounded by the project's own source.
@@ -2621,7 +3590,6 @@ _PHASE_ROLE = {
 # contracts:check"`, whose inner bash runs the SCRIPT `pnpm` ($0=contracts:check) →
 # a help screen, exit≠0. The identical wrong result then trips a convergence stall
 # (fb-9f107742fe4d).
-_CAPTURE_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 _CAPTURE_SHELL_C = frozenset({"-c", "-lc", "-ic", "-lic", "-cl"})
 
 
@@ -2629,7 +3597,7 @@ def _shell_wrapper_misuse(cmd: list[str]) -> str | None:
     """Return loud, actionable guidance if `cmd` is a redundant `<shell> -c …`
     wrapper (which capture double-wraps + mangles), else None. Caller fails CLOSED
     — never run the wrong thing silently."""
-    if len(cmd) >= 2 and Path(cmd[0]).name in _CAPTURE_SHELLS \
+    if len(cmd) >= 2 and Path(cmd[0]).name in _SHELLS \
             and cmd[1] in _CAPTURE_SHELL_C:
         return (
             f"[prusik-gate] capture already runs your command through `bash -c`, so a "
@@ -2831,6 +3799,31 @@ def mark_ci_observed(args) -> int:
     return 0
 
 
+def _declared_policy_command(root: Path, given: list[str]) -> tuple[str, str | None]:
+    """The command `--kind policy` runs, and a refusal when there is none to run.
+
+    A policy pipeline (pre-commit, lint-staged, a project script) has an exit code and no
+    count, so under --kind tests or lint it recorded a zero and condemned the evidence file
+    (fb-5d7b7cae0f30). What a policy entry records is that the project's OWN declared
+    command ran, and its exit code. So the command comes from `project_policy` in sprint-config, never from the
+    caller: `--kind policy -- true` would otherwise record a pass for any command at all."""
+    policy = (phases.load_sprint_config(root) or {}).get("project_policy")
+    declared = policy.get("command") if isinstance(policy, dict) else None
+    if not (isinstance(policy, dict) and policy.get("enabled") is True
+            and isinstance(declared, str) and declared.strip()):
+        return "", ("--kind policy runs `project_policy.command` from "
+                    ".claude/sprint-config.yaml, and no enabled project_policy block "
+                    "with a command is declared there. Nothing was run or recorded.")
+    declared = declared.strip()
+    asked = (given[0] if len(given) == 1 else shlex.join(given)).strip() if given else ""
+    if asked and asked != declared:
+        return "", (f"--kind policy runs only the declared `project_policy.command` "
+                    f"({declared!r}); it was given {asked!r}. Nothing was run or "
+                    f"recorded. Drop the command after `--`, or capture this one under "
+                    f"the kind that counts what it runs (tests, lint or types).")
+    return declared, None
+
+
 def capture(args) -> int:
     """Run a reviewer command, record prusik-captured execution evidence, and
     exit with the command's own exit code (transparent to pass/fail).
@@ -2844,6 +3837,14 @@ def capture(args) -> int:
     cmd = list(args.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
+    if args.kind == "policy" and (cmd or not getattr(args, "reset", False)):
+        # kind=policy takes its command from sprint-config, so none need be given. A
+        # bare `--reset` keeps its meaning for every kind: clear, record nothing.
+        declared, refusal = _declared_policy_command(root, cmd)
+        if refusal:
+            print(f"[prusik-gate] capture: {refusal}", file=sys.stderr)
+            return 2
+        cmd = [declared]
     if not cmd:
         # fb-9a095c7674f2: a standalone `--reset` is a CLEAR — discard the phase's
         # prior evidence and record NOTHING, so an agent never fakes a clear with a
@@ -2864,7 +3865,8 @@ def capture(args) -> int:
         print("[prusik-gate] capture: no command given after `--`",
               file=sys.stderr)
         return 2
-    misuse = _shell_wrapper_misuse(cmd)
+    # The declared policy command is the project's own; only a caller's command is checked.
+    misuse = None if args.kind == "policy" else _shell_wrapper_misuse(cmd)
     if misuse:
         print(misuse, file=sys.stderr)
         return 2
@@ -2916,7 +3918,13 @@ def capture(args) -> int:
     sys.stdout.write(combined)
 
     kind = args.kind
-    value = _parse_nonempty_primitive(kind, combined, cmd_str)
+    if kind == "policy":
+        # A policy pipeline has an exit code and no count, and none is made up for it. The
+        # advance gate reads a policy entry for its exit code alone, and never as the proof
+        # that anything was counted.
+        value = 0
+    else:
+        value = _parse_nonempty_primitive(kind, combined, cmd_str)
 
     # Is this real execution evidence, or a non-evidence artifact (the tool never ran / a
     # cache replay / …)? ONE registered classifier owns every known mode — see
@@ -3041,7 +4049,7 @@ def capture(args) -> int:
     import os as _os
     _os.replace(tmp, ev_path)
 
-    ok = exit_code == 0 and value > 0
+    ok = exit_code == 0 and (value > 0 or kind == "policy")
     ledger.append("reviewer_execution_verified", feature=args.feature,
                    phase=args.phase, exit_code=exit_code,
                    nonempty=value, kind=kind, ok=ok)
@@ -3420,6 +4428,10 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
                            declared=cov["declared"], proven=cov["proven"],
                            domain=cov["domain"], source=cov["source"])
             continue   # accepted as a proven, bounded, declared baseline
+        if np.get("kind") == "policy":
+            # The declared policy command exited 0 (a non-zero exit returned above). It
+            # carries no count and supplies none: see the counted-entry check below.
+            continue
         if not isinstance(np.get("value"), int) or np.get("value") <= 0:
             kind = np.get("kind")
             base = (f"phase {e.get('phase')!r} PASS but {kind}={np.get('value')} — "
@@ -3428,18 +4440,8 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
             # fb-b587d8d9b71c — make the honest path easy: a genuinely-clean run that
             # produced NO count (silent tsc, wrong test path) reads identically to a
             # no-op, so steer the fix per kind instead of a flat "nothing executed".
-            if kind == "types":
-                hint = (" If the typecheck is genuinely clean it ran SILENTLY with no "
-                        "count — re-capture with a files-counting flag (tsc: "
-                        "`--extendedDiagnostics`; mypy prints its own count) so a clean "
-                        "run is distinguishable from a no-op.")
-            elif kind == "tests":
-                hint = (" 0 tests executed — a wrong path, an auto-skip, or no "
-                        "collection. Point the command at real tests and re-capture.")
-            else:
-                hint = (" Re-capture a command that does real work, with a runner that "
-                        "is LOUD on an empty scope (ruff/eslint count files).")
-            return base + hint
+            from prusik import capture_diagnose
+            return f"{base} {capture_diagnose.zero_count_hint(kind)}"
         # v0.18.0 F §3.5 companion #1: empty baseline without declared
         # scope is itself a false-clean (the #13 [00:13] class — empty
         # known_failures declared from a structurally-blind context).
@@ -3460,6 +4462,14 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
                         f"(known_failures_count=0) WITHOUT declared "
                         f"domain+source — false-clean class: empty baseline "
                         f"from structurally-blind context (#13 [00:13])")
+    entries = schema.load_evidence(abs_path)
+    if all(e.get("nonempty_primitive", {}).get("kind") == "policy" for e in entries):
+        # A policy run proves the project's pipeline exited 0, not that the suite or the
+        # linter ran. It can add a refusal to a phase, never be the phase's whole proof.
+        return (f"phase {phase!r} PASS but its only evidence is the policy command — "
+                f"that proves the declared pipeline exited 0, not that anything was "
+                f"counted. Capture this phase's suite as well (`prusik gate capture "
+                f"--feature {feature} --phase {phase} --kind <tests|lint|types> -- <cmd>`).")
     ledger.append("reviewer_execution_verified", feature=feature,
                    phase=phase, ok=True,
                    nonempty=sum(e.get("nonempty_primitive", {}).get("value", 0)
@@ -3467,13 +4477,34 @@ def _evidence_unsatisfied(rel_path: str, feature: str | None,
     return None
 
 
+def _gate_artifact(kind: str, arg: str, template: str) -> Path | None:
+    """The file a `gate brief|scope|plan` argument names (fb-40d53eec7b0c): a feature
+    slug's artifact under the project root, else a path as given. A slug wins over a
+    same-named file in the cwd, as a sprint gate would read it. None means neither
+    exists, which is a wrong argument, said here so it never reads as an INVALID
+    artifact."""
+    if phases.SLUG_RE.match(arg):
+        slugged = ledger.project_root() / template.replace("<slug>", arg)
+        if slugged.is_file():
+            return slugged
+    path = Path(arg)
+    if path.is_file():
+        return path
+    print(f"[prusik-gate] {kind} not found: {arg!r} — pass a feature slug "
+          f"({template}) or a path to the file", file=sys.stderr)
+    return None
+
+
 def brief(args) -> int:
     from prusik import schema
-    ok, errors = schema.validate_brief(args.path)
+    path = _gate_artifact("brief", args.path, "briefs/<slug>.md")
+    if path is None:
+        return 2
+    ok, errors = schema.validate_brief(path)
     if ok:
-        print(f"[prusik-gate] brief valid: {args.path}")
+        print(f"[prusik-gate] brief valid: {path}")
         return 0
-    print(f"[prusik-gate] brief INVALID: {args.path}", file=sys.stderr)
+    print(f"[prusik-gate] brief INVALID: {path}", file=sys.stderr)
     for e in errors:
         print(f"  - {e}", file=sys.stderr)
     return 2
@@ -3494,11 +4525,14 @@ def baseline(args) -> int:
 
 def scope(args) -> int:
     from prusik import schema
-    ok, errors = schema.validate_scope(args.path, ledger.project_root())
+    path = _gate_artifact("scope", args.path, "design/<slug>/scope.md")
+    if path is None:
+        return 2
+    ok, errors = schema.validate_scope(path, ledger.project_root())
     if ok:
-        print(f"[prusik-gate] scope valid: {args.path}")
+        print(f"[prusik-gate] scope valid: {path}")
         return 0
-    print(f"[prusik-gate] scope INVALID: {args.path}", file=sys.stderr)
+    print(f"[prusik-gate] scope INVALID: {path}", file=sys.stderr)
     for e in errors:
         print(f"  - {e}", file=sys.stderr)
     return 2
@@ -3507,11 +4541,14 @@ def scope(args) -> int:
 def plan(args) -> int:
     from prusik import schema
     root = ledger.project_root()
-    ok, errors = schema.validate_plan(args.path, root)
+    path = _gate_artifact("plan", args.path, "design/<slug>/plan.md")
+    if path is None:
+        return 2
+    ok, errors = schema.validate_plan(path, root)
     if ok:
-        print(f"[prusik-gate] plan valid: {args.path}")
+        print(f"[prusik-gate] plan valid: {path}")
     else:
-        print(f"[prusik-gate] plan INVALID: {args.path}", file=sys.stderr)
+        print(f"[prusik-gate] plan INVALID: {path}", file=sys.stderr)
         for e in errors:
             print(f"  - {e}", file=sys.stderr)
     # v0.63.0 — plan-time blast-radius advisory (field finding #2). Non-blocking SIGNAL:
@@ -3520,7 +4557,7 @@ def plan(args) -> int:
     # alters rc; on failure it says so (not a silent skip).
     try:
         from prusik import blast_plan
-        feature = Path(args.path).parent.name
+        feature = path.resolve().parent.name
         adv = blast_plan.advisory(feature, root)
         if adv:
             print(adv)
@@ -3531,7 +4568,7 @@ def plan(args) -> int:
     # agent silently falls back to a manual stand-in. Flag it before the build.
     try:
         from prusik import roles
-        adv = roles.advisory(Path(args.path).parent.name, root)
+        adv = roles.advisory(path.resolve().parent.name, root)
         if adv:
             print(adv)
     except Exception as e:  # noqa: BLE001 — advisory must never break the gate

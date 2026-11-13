@@ -25,8 +25,6 @@ import tempfile
 import time  # noqa: F401  (re-exported)
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 # Re-export commonly imported prusik modules so split files can do
 # `from ._common import gate, phases, kit_init, ...` without
 # re-listing the full import block in every file.
@@ -60,6 +58,13 @@ def _copy_sprint_config(tmp):
         Path(__file__).parent.parent / "prusik" / "templates" / ".claude" / "sprint-config.yaml",
         tmp / ".claude" / "sprint-config.yaml",
     )
+
+
+def _write_retro(root, feature):
+    """The last phase's exit artifact, so a test's sprint can really close."""
+    path = root / "design" / feature / "retro.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("## What happened\nx\n## What surprised\ny\n## Updates to CLAUDE.md\nnone\n")
 
 
 def _wt_file(tmp, role, rel, content):

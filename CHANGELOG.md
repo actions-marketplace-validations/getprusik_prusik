@@ -3,6 +3,344 @@
 All notable changes to **Prusik** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions are `MAJOR.MINOR.PATCH`.
 
+## [0.238.8] — three small frictions: negative CSS utilities, the lease hint, fix-round status
+
+- **A leading hyphen is not a naming convention (fb-cba134e72aef).** The cross-builder CSS advisory
+  reported `-mr-2` as a variant of `mr-2` and `-rotate-90` of `rotate-90`. Those are negative
+  utilities, generated at build time and defined in no CSS source. A used class that starts with
+  `-` is no longer compared. The seam the check exists for, `client-table` against
+  `client__table`, is still reported. The advisory still reads whole worktrees, not the sprint's
+  diff.
+- **The lease refusal says how to hand off (fb-3e80f782a066).** `prusik gate release-writer && git
+  push` was refused with a hint that named release-writer and did not say why it had not worked.
+  The gate judges a whole command before any of it runs, so the release had not happened yet. Every
+  lease refusal now says release-writer runs as its own command, and a refused command that
+  contains it is told to run the release alone and then the rest. The decision is unchanged.
+- **`fix-round status` takes `--feature` (fb-427305c05d6b).** `start` and `end` require it, so a
+  reviewer passed it to `status` and argparse refused. It is accepted and changes nothing.
+
+## [0.238.7] — a capture that counted nothing is refused, not recorded
+
+- **A zero-count green run no longer poisons the evidence file (fb-5d7b7cae0f30).** `prusik gate
+  capture` recorded an exit-0 run that counted nothing (`tests=0`, `lint=0`), and the advance gate
+  then rejected the whole file for it. A re-capture only appends, so the one way out was `--reset`
+  and re-running every suite. In the field this was a policy script captured under `--kind tests`
+  and a security audit under `--kind lint`. Capture now refuses such a run with a non-zero exit,
+  records nothing, logs `capture_non_evidence` with mode `nothing_counted`, and leaves evidence
+  already in the file untouched.
+- **This adds a refusal at capture and removes one at advance.** A reviewer whose command counts
+  nothing now sees the refusal when it runs, not at the next advance. With no other entry the
+  advance gate still finds no evidence, so nothing passes that did not pass before. A file from an
+  older version that holds a zero-count entry is still refused at advance.
+- **The project's policy command has its own kind.** The sentinel's role file told it to wrap
+  `project_policy.command` in `--kind tests`. A policy pipeline has an exit code and no count, so
+  that instruction was the poisoning capture. `prusik gate capture --kind policy` now runs the
+  command declared under `project_policy` in sprint-config and records its exit code, with no
+  count made up for it. It takes the command from the config, never from the caller:
+  `--kind policy -- true` is refused with exit 2, as is `--kind policy` with no enabled
+  `project_policy` block. At advance a failing policy entry refuses the phase, and a phase whose
+  only evidence is policy entries is refused too: a policy run can block, never be the proof.
+  The role file's step 6 names it. A policy entry is not yet required at advance.
+- **Any other command with nothing to count does not belong in capture.** An audit or a one-off
+  script is not execution evidence. The refusal says so.
+- **A failing run is still recorded.** A non-zero exit with a zero count is a real failure.
+- **One source for the remedy.** The per-kind hint lives in `capture_diagnose.zero_count_hint` and
+  is used by both the capture refusal and the advance message.
+
+## [0.238.6] — a finding must say something, and the README says what is true
+
+- **A mistyped verb no longer opens a ticket (fb-84cc77a2bbc4).** `prusik feedback list` was filed
+  as an empty finding titled "list", rc=0, because any word that is not a ticket verb was taken as
+  a title. A one-word title with no `--detail` and no `--repro` is now refused with rc=2 and writes
+  nothing; the message names `--list` and the verbs. A title of two or more words, or one word with
+  detail or a repro, files as before.
+- **The README's numbers were stale, and are corrected.** The field record said 43 filed, 43
+  closed, zero open. On 2026-11-11 it is 74 filed by two design-partner products, 67
+  verified-closed, 7 open, and the line now carries its date. Pinned findings were stated as 98
+  and are 123; tests as 1,900+ and are 2,800+.
+- **The Action example pins a release, not `@main`.** It names `getprusik/prusik@v0.238.6`.
+- **Two README claims are now held by tests.** The pinned-findings count must equal the ids in
+  `_closures.json` and appear once, and the Action pin must equal `v` + `__version__`, so a release
+  cannot leave either behind. The field record has no source inside the engine and stays a dated
+  snapshot.
+
+## [0.238.5] — heredocs are read as bash reads them
+
+- **Only a real `<<` opens a heredoc (fb-ccd55bc92cb0).** The stripper was a regex with no idea of
+  quoting. `echo "use <<EOF in docs"` or `echo $((1<<2))` opened a body, so every line up to a
+  look-alike delimiter went unread, and an `rm` there named nothing. It now reads `<<` only where
+  the quoting mask leaves it as code, and `\<<EOF` is a redirect. Where the mask stops marking, a
+  later quoted `<<` still reads as an operator, which fb-401f6430ec61 tracks.
+- **An unquoted body keeps its substitutions.** `$(rm a)` or `` `git push` `` in a `cat <<EOF` body
+  run in bash, and now read as commands, with or without quotes around them in the body.
+- **This is the change most likely to add a refusal.** A body handed to a shell is code now:
+  `bash <<EOF`, `sh -s <<'EOF'`, `<<EOF bash` and `cat <<EOF | sh`, for bash, sh, zsh, ksh and dash
+  on any path. `bash script.sh <<EOF` reads as code too, though it runs no body. Over 5,472 real
+  heredoc commands from local transcripts, no verdict changed.
+- **The delimiter is bash's.** The closing line matches exactly, with leading tabs only for `<<-`.
+  `<<'END OF'`, `<<a-b`, `<<a.b` and `<<\EOF` work, and `<<\EOF` or `<<E'O'F` keep a body literal.
+  A heredoc with no closing line stays code.
+- **`bash -c` code has its heredocs stripped.** `bash -c 'cat <<EOF\ngit push\nEOF'` was refused for
+  `git push`. It is not now. `eval` and `trap` text still reads as code.
+
+## [0.238.4] — deny_commands and the writer lease read commands where bash runs them
+
+- **One reader of what a command line runs (fb-7610468920d4).** `_command_denied` and
+  `_shared_tree_git_mutation` split on separators and compared first tokens, so `(git push)`,
+  `if git push`, `>o git push`, `X=1 git push`, `! git push`, `{ git push; }`, a case arm,
+  `$(git push)` and a backtick all passed a phase deny and the lease check. Both now use
+  `_named_commands`, built on the positions the write check reads. It follows `bash -c`, `eval`,
+  `trap` and backtick bodies, and a resolved `$G`. Shell code nested past 32 levels is refused.
+- **This is the change most likely to add a refusal.** In a phase that denies `git push` or
+  `git merge`, the deny now applies past git's global flags, so `git -C <dir> push` and
+  `git -c k=v merge` are refused, whichever repo `<dir>` names, as `cd <dir> && git push` already
+  was. A `VAR=x git push` is refused too.
+- **The lease judges where git acts.** `-C`, `--git-dir` and `--work-tree` count from the `cd` in
+  force, and several `-C` join. `cd "/path with spaces"` and a `$R` the command set now resolve, so
+  a git command in another repo no longer counts as this tree's.
+- **Quoted text is no command.** `git log --grep 'x; git push y'` and
+  `git commit -m "a; git push b"` were refused for `git push`. They are not now.
+- **An escaped operator separates nothing.** `echo \; git push` was read as two statements, and the
+  same mask now covers `\;`, `\&`, `\|`, `\(`, `\)` and `\{` for the write check too.
+- **The write check reads a backtick body.** `` echo `rm a` `` named nothing. Backticks get a scan
+  of their own, since the literal mask stops at the first one.
+
+## [0.238.3] — The bash gate reads every statement, and its own failure refuses the call
+
+- **A heredoc's opening line is read (fb-a9456cbd1f88).** The stripper removed everything from `<<`
+  through the closing delimiter, so `cat <<EOF > out`, `cat <<EOF; rm a` and `cat <<EOF | tee x`
+  reached the gate with the write gone. Only the body is removed now. This is the change most likely
+  to add a refusal, for a heredoc written to a path the phase doesn't allow.
+- **A gate that fails refuses (fb-860c63485143).** A hook that raises exits 1, which Claude Code
+  treats as a non-blocking error, so the tool ran ungated. `pre_tool` now denies any call it could
+  not judge, names the fault, and records `gate_blocked` with the new class `gate_fault`. A fault in
+  the gate therefore stops writes and Bash until it is fixed, by design. That includes a damaged
+  `.claude/sprint-config.yaml` or `.sprint/state.json`, which now needs repair outside the session.
+- **A gate out of time refuses (fb-d325f0be82a2).** A hook the host kills at 15s can deny nothing, so
+  `pre_tool` raises at 12s, inside a running regex too, and denies the same way. Windows has no
+  interval timer, so there the deadline is off and a slow gate still passes the call.
+- **Three regexes are linear.** 48KB of `/` took 26s in `_FILE_VERB_RE` on every Bash call, and now
+  takes 2ms. `_MUTATION_RE` and `_C_PAYLOAD_RE` are bounded too. A subscript over 256 characters
+  counts as a mutation of its name, and `-c` is found after at most 32 words.
+- **More statements are read (fb-961eaed62314).** A file verb is now seen after a leading redirect
+  (`>o rm a`), a subscripted prefix (`X[0]=1 rm a`), a case label, and a keyword before a continued
+  line. `cd` tracking and variable binding read the same statement starts, and a case label no
+  longer reads as a subshell.
+- **A flag in a variable is a flag.** After `S=-t; cp $S design a` the gate names `design/a`. A value
+  bash would split, as in `S="-t d"; cp $S a`, fails closed. A name with no value in the command is
+  still one operand.
+- **Still open.** `deny_commands` and the writer lease split statements naively, so `(git push)`
+  passes both (fb-7610468920d4). `find -exec`, `xargs`, `sudo`, `env` and `time` stay unread
+  (fb-0e678051f98e). The heredoc stripper still reads `<<` in quotes and arithmetic as a heredoc,
+  and reads no command in a heredoc body (fb-ccd55bc92cb0).
+- **Proof.** The replay is in `reports/gate-reads-every-statement/field-replay.txt`.
+
+## [0.238.2] — A sprint closes only from its last phase, with that phase's exit artifacts
+
+- **A close checks the last phase's exit artifacts (fb-a959d1f48f12).** Only the Stop hook read them,
+  and a close clears the state it reads, so a close in the same turn as the advance skipped the
+  check. `gate sprint-complete` now uses the rule advance uses, before anything else runs. A missing
+  retro or a missing required section returns rc 2, names it, and leaves the sprint open.
+- **A close from an earlier phase is refused.** `reviewing` can be fully satisfied with no retro, so
+  a sprint must reach its last phase, read from the config.
+- **Expect this to fire on retros with freeform headings.** Of 172 field closes, 115 pass and 57
+  would be refused: 6 with no retro and 51 whose retro lacks a required section, often `## Outcome`
+  in place of `## What happened`. The sections were always required. Fix the headings and retry, or
+  change `required_sections` in your sprint config. There is no override flag.
+- **Refused closes are measured.** A later close now resolves a block on the close, including
+  deferred-tier blocks, which stayed unresolved before. The new gate class is
+  `close_before_last_phase`.
+- **Proof.** The replay is in `reports/close-requires-exit-artifacts/field-replay.txt`.
+
+## [0.238.1] — A logged deviation credits the one file it names
+
+- **A token credits by path, not by file name (fb-82127b9f9ca9).** `DEV-001: api/util.py` also credited
+  `web/util.py`, and any other `util.py`, at the builder boundary. A token now names the paths whose
+  trailing segments equal it, so `errors/E.ts` still credits `src/errors/E.ts`.
+- **A token naming several files credits none.** Two thirds of the path tokens in field logs are bare
+  names, so a bare `index.ts` would still have credited every `index.ts`. It now credits only when
+  one distinct out-of-boundary file carries that name, across all worktrees. Otherwise the violation
+  names the token and says to log the full path.
+- **A token equal to a whole path is that path**, so a file at the root can always be logged.
+- **A logged path reads the way builders write it.** A `worktrees/<role>/` prefix and an absolute
+  path under the project are read as the project-relative path.
+- **Proof.** Over the 15 field sprints with a log and a scope, 33 files were credited before and
+  the same 33 after, in `reports/deviation-names-one-file/field-replay.txt`.
+
+## [0.238.0] — The bash gate reads the file verbs
+
+- **`cp`, `mv`, `rm`, `truncate`, `dd`, `touch` and `install` are gated (fb-f113f05860db).** Each
+  changed a file the Write tool had been refused. The field held 88 such writes the gate never saw,
+  mostly `cp worktrees/<role>/src/... src/...` into the main tree during `building` and `reviewing`.
+  The verbs are read at command position only, so `git rm`, `pip install` and `echo rm x` name
+  nothing, and sources and reference files are never named.
+- **A literal assignment in the command resolves.** `S=/tmp/x; cp a "$S/b"` lands at `/tmp/x/b`, for
+  redirects, `tee`, in-place editors, the file verbs and `cd`, and `$HOME` resolves as `~` does. A
+  name assigned twice, after the use, in a subshell, as a `VAR=x cmd` prefix, or by `for` or `read`
+  still fails closed, as does a command substitution, a `'$S'` or `\$S`, an unquoted value bash
+  would split or glob, and every name in a command holding `eval` or `source`. `> "$LOG"` no longer
+  needs the Write tool when the command sets `LOG`.
+- **A relative path starts from the shell's directory.** `ToolEvent` carries the host's `cwd`, so a
+  relative target in a shell sitting in `worktrees/solo` lands there, and a git commit from there no
+  longer counts as a shared-tree write.
+- **Regenerable directories can always be cleared.** `rm` of a path through `_DERIVED_DIRS`, `.venv`
+  or `venv` names nothing, because the gate refuses to advance with caches left behind. The check
+  reads the normalized path, so `rm .pytest_cache/../design/f/scope.md` is still named.
+- **Still not read.** `xargs rm`, `find -exec`, `find -delete`, `sudo` and `env` hide a file verb, so
+  `xargs sed -i` fails closed while `xargs rm` stays unread (fb-0e678051f98e). `ln`, `rsync`, `tar`,
+  `unzip`, `patch`, `curl -o`, `mkdir` and `rmdir` are not read either (fb-331f8487c548).
+- **Position checks are linear.** Command position is one forward pass over statement starts, so a
+  long command stays cheap in the hook, a separator inside a quoted `X="a;b" rm f` prefix splits
+  nothing, and a continued line starts no statement.
+- **Proof.** Over 5,822 in-sprint field commands at the phase each ran in, every refusal added or
+  dropped against v0.237.1 is classified in `reports/bash-file-verbs/field-replay.txt`: 105 added,
+  68 dropped, none unexplained, none a regenerable cleanup.
+
+## [0.237.1] — The boundary matches paths, not strings
+
+- **A module admits itself and what lies under it (fb-cbaf583f3925).** `builder_writes_within_plan`
+  compared strings, so `api/x` admitted `api/xyz.py`, `x.py` admitted `x.py.bak`, and a prose bullet
+  such as `+ a new module` declared `a` and admitted every path starting with it. It now compares
+  path segments through `schema.module_covers`.
+- **A module that names no repo path admits nothing.** `/`, `./`, an absolute path and one using `..`
+  match no file, so an older scope holding one fails closed. `validate_scope` and `validate_plan`
+  refuse them, with or without a `+`. `/etc` no longer passes the existence check by resolving
+  outside the project.
+- **A scope that declares nothing no longer skips the boundary.** A `## Modules touched` whose only
+  bullet is `.` parsed to no modules, and the check then returned clean. It now admits nothing, and
+  both validators refuse it.
+- **A deviation credits by file name only.** `_is_declared` also matched by string suffix, so a logged
+  `lib/ax.py` credited `x.py`. A logged partial path still credits the fuller path, by name.
+- **The hook budget tests survive a busy host.** They timed the bare interpreter and the hook in
+  separate runs, so a load spike during one failed bare `pytest`. Each round now times both back to
+  back and the budget reads the median ratio. Injected imports still fail it, at 2.25x against 1.75x.
+- **Proof.** Across every field scope and every path in each repo's history, each changed verdict is
+  classified in `reports/boundary-path-segments/field-replay.txt`.
+
+## [0.237.0] — The bash gate sees every write it can name, where it lands
+
+- **`sed -i` and `perl -i` are gated (fb-a609748e159f).** An in-place edit changed a file the Edit
+  tool had just been refused. The gate now reads their argv, in every flag form real sed and perl
+  accept, and names each edited file and never the script. `_bash_redirect_targets` is now
+  `_bash_write_targets`.
+- **A target is judged where it lands.** A relative target after `cd d` is `d/target`. Chained `cd`s
+  join, a `cd` inside `( )` or `$( )` ends with it, and `pushd` and `popd` move the same way. `cd worktrees/solo && echo a > f` was judged
+  as `f` at the project root. 154 of 309 field `sed -i` commands follow a `cd`, so gating them
+  without this would have refused real worktree edits.
+- **Bash decides what a redirect is (fb-2efaa09c9545).** No separator is needed before an operator,
+  so `cat> f1` and `esac> f1` are seen, as are `>|`, `>&f`, `<>` and `{fd}>`. Arithmetic and `[[ ]]`
+  are literal text. A target is read as one shell word, so `a\ b` and `"a b"c` are whole. `~/x`
+  expands, and `tee` names every file it is given, past any `>(...)` among them.
+- **An unresolvable target fails closed and says so (fb-7e7454d19bc0).** `> $OUT` was missed while
+  `> $OUT/x` was refused under a path it isn't. Any target holding `$` or a backtick, and an in-place
+  edit whose files come from `xargs` or `find -exec`, is now checked unexpanded. A refusal says the
+  gate can't tell where the target lands, offers no worktree route, and asks for the literal path.
+  `> "$LOG"` is now refused in a phase with a narrow writable set, so name the path instead.
+- **Literal text stays literal in more commands.** The mask read `--eval` as `eval`, counted an
+  escaped backtick as a real one, and gave up on the first `"$(...)"` or `${x}`. It now reads
+  `$(...)` in double quotes by the same rules, and turns off only for an `eval`, `trap` or `| sh`
+  outside literal text. A `-c` payload holding `\"` is stripped whole.
+- **Proof.** A 3,000-case fuzz against real bash, sed and perl: v0.236.1 missed 842 writes, this
+  release none. Over 61,157 field commands, every added or dropped target is classified.
+- **Still unread.** `cp`, `mv`, `rm`, `truncate`, `dd`, `touch` and `install`, `bash -c` and
+  `python -c` payloads, and variables assigned earlier in the same command.
+
+## [0.236.1] — Every pytest invocation collects the same suite
+
+- **`pytest <file>` works (fb-c515bcaf0476).** 60 of 163 test modules failed collection alone with
+  `No module named 'tests'`, and `pytest tests` failed 28. `pyproject.toml` now sets
+  `pythonpath = ["."]`, so the repo root is importable before any conftest loads. The
+  `sys.path.insert` in `tests/_common.py` is gone.
+- **`testpaths` is honoured (fb-c515bcaf0476).** `tests/conftest.py` left the repo while it was
+  imported, before pytest globbed `testpaths`. The glob came back empty, so pytest walked the whole
+  repo, including any sprint worktree, and bare `pytest` passed only because that walk reached
+  `prusik/` first. The chdir now runs in `pytest_configure`, still before collection.
+- **A worktree tests its own code.** Bare `pytest` inside a worktree imported the main tree's
+  `prusik` through the editable install. It now imports the worktree's. `python -m pytest` was
+  always right, and CI uses that form.
+
+## [0.236.0] — Gates take a slug, and a role is never told to run what it can't run
+
+- **`gate brief`, `gate scope` and `gate plan` take a slug (fb-40d53eec7b0c).** `prusik gate brief
+  my-feature` used to fail as `brief INVALID` on a healthy brief. All three now take a feature slug
+  or a path, through one resolver. A slug resolves against the project root from any directory,
+  and it wins over a same-named file in the cwd.
+- **A wrong argument reads as one (fb-40d53eec7b0c).** A missing file or a directory now prints
+  `not found` and the two accepted forms, where a directory used to give a traceback. The exit
+  code stays 2. `INVALID` now always means the file was read and its content failed.
+- **The orchestrator owns the mechanical check (fb-02d01d7a2a59).** The brief-critic has no shell,
+  yet its spec told it to run `prusik gate brief`, so all 12 field rounds reported they could not.
+  `/sprint-start`, `/sprint-run` and `gate sprint-init` now run the gate first, stop on failure and
+  pass its output to the critic. `/sprint-run` runs `prusik gate plan` after the feature-planner,
+  which had the same defect. A test over all 15 roles keeps a role without Bash from being told to
+  run a command.
+- **Critiques separate blocking from advisory (fb-02d01d7a2a59).** Items are labelled `blocking:` or
+  `advisory:`, and a review with only advisory items is a PASS. The rule is in the role spec: no
+  gate rejects a FAIL with no `blocking:` item. **Adopters get the new specs and commands on
+  `prusik update`.**
+
+## [0.235.1] — The redirect gate reads shell quoting
+
+- **Quoted text is no longer a redirect (fb-48a328898d07).** A `>` or `tee` inside quotes, after a
+  backslash or in a comment used to block the command as a write. The gate now tells literal text
+  from a real redirect, so a sed pattern or a prose argument passes. The check adds no import.
+- **It doesn't trade a real redirect for that.** Where it can't be sure, it scans the command as
+  before: `$(`, `${`, `$'` or a backtick, an unterminated quote, and text a shell runs again, such
+  as `eval`, `trap` or `| sh`. Tests check each case against real bash. Those commands keep today's
+  false blocks, and indirection like `$cmd "..."` stays out of reach, as `bash -c` payloads are.
+- **A redirect right after a closing quote is now caught.** `echo "hi">out.log` used to be missed.
+
+## [0.235.0] — A refused sprint-start changes nothing, and markdown can't change a size verdict
+
+- **A refusal has no side effects (fb-3adb150c6991).** `sprint-start --force-clean` used to
+  un-pause and announce the discard of the old sprint, then refuse on a missing gate. A rejected
+  `--trivial` deleted worktrees and reaped the open fix-round before refusing. Every refusal now
+  comes before the first change to state. A start that passes every gate still discards.
+- **A second feature can prepare while a sprint is active (fb-3adb150c6991).**
+  `design/*/product-fit.md` is writable in every phase, which ends the loop of needing the file to
+  start a sprint and needing the sprint to write the file.
+- **Markdown can't change a verdict (fb-5bf7db8c67a1).** `**L**`, `**L.**`, `` `L` `` and `L,` all
+  read as `L`, through one `schema.extract_enum_value` shared by validation, triage, the size rule
+  and the `--trivial` check. **A bolded size now reaches triage's size rules, so a bold `L` or
+  `XL` can route differently than it did.**
+- **The type/size rule flags, as it always documented (fb-5bf7db8c67a1).** A `bug_fix`, `doc` or
+  `config` brief at size L or XL no longer blocks leaving scoping. It prints a warning and records
+  `size_type_flag`. All 8 field hits were honest large bug fixes, and 7 only passed because their
+  size was bold.
+
+## [0.234.0] — One parser for Modules touched, and prose can't open the builder boundary
+
+- **Prose no longer declares modules (fb-c554221bbd75).** Every backticked word in a bullet used
+  to count as a module. A bullet now declares its first path plus backticked paths joined to it
+  by `,`, `;`, `+`, `&`, `and` or `or`, and a joined span must look like a path, so a joined
+  symbol declares nothing. **A file named only in a scope bullet's description is no longer in
+  scope: declare it in the bullet's head, or log it in `deviations.md`.**
+- **The builder boundary closes a fail-open.** A prose `/` became an empty prefix that matched
+  every file, which switched the boundary off. Prefixes like `re` and `as` widened it.
+- **Every gate reads the same list.** `schema.declared_modules` replaces separate readers in scope
+  validation, the consistency checks, triage, affected tests and plan reach. The last three gain
+  the `(final)` header suffix and exclusion subsections they were missing.
+- **New files survive triage (fb-4e4a9fe3d850, fb-8f6e68b77a32).** `scope_summary.modules` keeps
+  `+ path` bullets as paths instead of a bare `+`.
+- **Comma-joined paths parse (fb-e0c3707245d2).** `` `a.sh`, `b.md` `` yields both with no stray
+  backtick, and each is checked for existence. A joined path that doesn't exist now fails
+  `gate scope`, where it used to go unchecked.
+- **An exclusion subsection stops at its own section.** A `### NOT in the touch-list` at the end
+  of one section no longer swallows a following `## Modules touched (final)`.
+- **The enforcer checks what the gate checks (fb-967150eabdce).** Step 0 now uses scope.md, logged
+  deviations and predicted fan-out, and never FAILs a file for missing from plan.md.
+
+## [0.233.1] — CI gates hook cost deterministically, not by wall clock
+
+- **Noise no longer turns main red (fb-e10892101b85).** The stop hook sits at its 1.75× wall-clock
+  budget on GitHub runners, so the check failed on commits that never touched the hook path.
+  Both wall-clock budget tests now skip when `CI` is set and stay a hard local check at the same
+  budget. The budget itself is unchanged.
+- **CI's hook-cost checks now cover what only wall clock used to catch.** Each hook has a stdlib
+  allowlist, measured on macOS and Linux across Python 3.10–3.13, and a subprocess spawn budget
+  recorded by an audit hook. Tests prove both reject a regression. This is a test-only release;
+  the shipped package changes only its version and closures.
+
 ## [0.233.0] — The open-core boundary gate finds the private registry from a worktree
 
 - **The pre-commit boundary hook now runs in worktrees (fb-92d4815981be).** It looked for the

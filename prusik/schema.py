@@ -11,7 +11,7 @@ import itertools
 import json
 import re
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -111,19 +111,21 @@ def substantive_hash(path: Path, extra_exclude: tuple[str, ...] = ()) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def _extract_enum_value(body: str) -> str | None:
-    """First non-whitespace token of the body.
+def extract_enum_value(body: str) -> str | None:
+    """First non-whitespace token of the body, the one reader for enum-like sections
+    (`## Type`, `## Size`, `## Priority`, `## Milestone`).
 
     v0.4.1: strips markdown wrappers (**S**, *S*, `S`, _S_) before matching
     so a scoping agent that bolds a single-letter enum value doesn't cost
-    a round-trip.
+    a round-trip. Punctuation can sit on either side of a wrapper (`**L**,`
+    and `**L.**`), so it is stripped on both.
     """
     stripped = body.strip()
     if not stripped:
         return None
     from prusik import artifact_variants as av
-    tok = av.strip_markdown_wrappers(stripped.split()[0])
-    return tok.rstrip(",.")
+    return av.strip_trailing_punct(
+        av.strip_markdown_wrappers(av.strip_trailing_punct(stripped.split()[0])))
 
 
 # Ordered-list marker: digits + `.` or `)` + at least one space (CommonMark
@@ -265,7 +267,10 @@ def extract_path_token(s: str) -> str:
     # the label can contain spaces.
     m = re.match(r"^\s*\[[^\]]*\]\(([^)]+)\)", s)
     tok = m.group(1) if m else s.split()[0]
-    return av.strip_trailing_punct(av.strip_markdown_wrappers(tok))
+    # Punctuation goes first: in "`a`," the comma hides the closing backtick from the
+    # wrapper strip (fb-e0c3707245d2).
+    return av.strip_trailing_punct(
+        av.strip_markdown_wrappers(av.strip_trailing_punct(tok)))
 
 
 def extract_module_token(bullet_body: str) -> tuple[str, bool]:
@@ -305,11 +310,91 @@ def extract_module_token(bullet_body: str) -> tuple[str, bool]:
     return token, is_new
 
 
+# A bullet's declared head: backticked paths joined to the first one. Everything after
+# the head is description, and backticked text there names code, not modules.
+_DECLARED_SPAN = re.compile(r"(\+\s*|new\s+)?`([^`]+)`")
+_SPAN_JOINER = re.compile(r"\s*(?:[,;]\s*(?:(?:and|or)\b)?|[+&]|\b(?:and|or)\b)\s*")
+
+
+def _is_path_like(token: str) -> bool:
+    return "/" in token or "." in token.lstrip(".")
+
+
+def extract_declared_paths(bullet_body: str) -> list[tuple[str, bool]]:
+    """(path, is_new) for every path a `## Modules touched` bullet declares.
+
+    `a.sh`, `b.md` — x and `a.sh` + `b.yml` — x each declare two paths
+    (fb-e0c3707245d2, fb-75fd9cfa7ead). `a.py` — add `render` declares one
+    (fb-c554221bbd75). `a.py` and `render` also declares one: a joined span must look
+    like a path, so a symbol can't fail the existence check. A leading `+ ` marks every
+    path in the head as new; a joining `+` does not, because it is only a conjunction.
+    """
+    text = bullet_body.lstrip()
+    span = _DECLARED_SPAN.match(text)
+    primary, is_new = extract_module_token(span.group(2) if span else text)
+    is_new = is_new or bool(span and span.group(1))
+    if not primary:
+        return []
+    declared = [(primary, is_new)]
+    while span:
+        joiner = _SPAN_JOINER.match(text, span.end())
+        span = _DECLARED_SPAN.match(text, joiner.end()) if joiner else None
+        if span:
+            token, marked = extract_module_token(span.group(2))
+            if _is_path_like(token):
+                declared.append((token, is_new or marked or bool(span.group(1))))
+    return declared
+
+
+def declared_modules(text: str) -> list[tuple[str, bool]]:
+    """(path, is_new) for every module an artifact declares. The only reader of
+    `## Modules touched`, so no two gates can disagree about what a scope says.
+
+    Unions a suffixed or restated header (`## Modules touched (final)`) and drops
+    exclusion subsections.
+    """
+    # Strip per section: on the joined text, an exclusion subsection at the end of one
+    # section would swallow the whole of the next.
+    body = "\n".join(strip_non_declaration_subsections(b)
+                     for h, b in parse_sections(text).items()
+                     if h.startswith("## Modules touched"))
+    return [pair for item in extract_list_items(body)
+            for pair in extract_declared_paths(item)]
+
+
+def module_segments(token: str) -> tuple[str, ...]:
+    """The repo-relative path segments a declared module names. Empty when it names no
+    path inside the repo: `/`, `.`, an absolute path, or one that uses `..`."""
+    path = PurePosixPath(token)
+    if path.is_absolute() or ".." in path.parts:
+        return ()
+    return path.parts
+
+
+def module_covers(module: str, rel_path: str) -> bool:
+    """A module covers itself and what lies under it, by segment: `api/x` covers
+    `api/x/y.py` and not `api/xyz.py` (fb-cbaf583f3925). A module with no segments covers
+    nothing, so a scope that predates the validators fails closed."""
+    segments = module_segments(module)
+    return bool(segments) and PurePosixPath(rel_path).parts[:len(segments)] == segments
+
+
+def _invalid_module_errors(text: str) -> list[str]:
+    modules = declared_modules(text)
+    if not modules and any(h.startswith("## Modules touched") for h in parse_sections(text)):
+        return ["modules_touched: declares no path, so the boundary would admit nothing"]
+    return [
+        f"modules_touched: not a path inside the repo: {token}\n"
+        f"    Name a file or directory relative to the project root."
+        for token, _is_new in modules if not module_segments(token)
+    ]
+
+
 def _validate_field(name: str, body: str, spec: dict) -> list[str]:
     errors: list[str] = []
     ftype = spec.get("type", "text")
     if ftype == "enum":
-        val = _extract_enum_value(body)
+        val = extract_enum_value(body)
         allowed = spec.get("values", [])
         if val not in allowed:
             errors.append(f"{name}: value '{val}' not in {allowed}")
@@ -1076,6 +1161,7 @@ def validate_scope(path, project_root: Path | None = None) -> tuple[bool, list[s
         return False, [f"Scope not found: {path}"]
     text = p.read_text()
     errors = _validate_sections(text, load_schema("scope"))
+    errors.extend(_invalid_module_errors(text))
     if project_root:
         errors.extend(_validate_milestone(text, project_root))
     # Cross-ref: modules_touched paths must exist relative to project root.
@@ -1084,18 +1170,11 @@ def validate_scope(path, project_root: Path | None = None) -> tuple[bool, list[s
     # 5 new ADR files). Those skip the existence check; everything else
     # still must exist.
     if project_root:
-        sections = parse_sections(text)
-        modules = extract_list_items(strip_non_declaration_subsections(
-            sections.get("## Modules touched", "")))
-        for m in modules:
-            # v0.5.5: delegate to shared helper so `validate_scope` and
-            # `consistency._modules_from` can't drift on bullet interpretation.
-            token, is_new = extract_module_token(m)
-            if not token:
-                continue
-            if is_new:
+        for token, is_new in declared_modules(text):
+            if is_new or not module_segments(token):
                 # New-file marker: skip existence check. Typo detection moves
-                # to builder time (file create fails).
+                # to builder time (file create fails). A module outside the repo
+                # is already refused above.
                 continue
             if not (project_root / token).exists():
                 errors.append(
@@ -1120,6 +1199,7 @@ def validate_plan(path, project_root: Path | None = None) -> tuple[bool, list[st
         return False, [f"Plan not found: {path}"]
     text = p.read_text()
     errors = _validate_sections(text, load_schema("plan"))
+    errors.extend(_invalid_module_errors(text))
     if project_root:
         # Infer feature from path shape design/<feature>/plan.md when possible,
         # then run the plan ⊆ scope check if a scope artifact exists.

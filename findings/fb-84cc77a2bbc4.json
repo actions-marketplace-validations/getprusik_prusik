@@ -1,0 +1,31 @@
+{
+  "id": "fb-84cc77a2bbc4",
+  "created_at": "2026-11-11T05:29:57.634716+00:00",
+  "kind": "bug",
+  "severity": "med",
+  "title": "a mistyped ticket verb files an empty finding: 'prusik feedback list' opened a ticket titled 'list'",
+  "detail": "The positional is a title OR a verb. Any word outside _TICKET_VERBS (list, ls, close, status, help) is taken as a title and filed with empty detail, rc=0, and rides the next export to HQ. Hit 2026-11-11 while trying to list findings. A one-word title with no --detail or --repro says nothing and should be refused with rc!=0, naming --list and the verbs. Same sprint corrects stale README claims: field record says 43/43 zero open (live: 74 filed, 67 closed, 7 open), 98 pinned findings (live: 122), 1,900+ tests (live: 2,894), and the Action example pins @main.",
+  "feature": null,
+  "content_hash": "84cc77a2bbc4",
+  "repro": "prusik feedback list",
+  "duplicate_of": null,
+  "thread": [],
+  "resolution": {
+    "type": "fix",
+    "verify": ".venv/bin/python -m pytest tests/test_feedback_says_something.py -q",
+    "fixed_in": "0.238.6",
+    "reason": "",
+    "verify_kind": "tests"
+  },
+  "verify_history": [
+    {
+      "at": "2026-11-11T06:18:24.988894+00:00",
+      "exit": 0,
+      "executed_count": 12,
+      "verdict": true,
+      "why": "12 test(s) executed, exit 0",
+      "worktree_hash": "79bb156-dirty"
+    }
+  ],
+  "status": "verified-closed"
+}

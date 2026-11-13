@@ -66,10 +66,14 @@ def test_v0120_capture_all_skip_yields_zero_executed():
     """The #13[00:13] / DEV-1 auto-skip false-clean, closed mechanically."""
     tmp = _mktmp_project()
     try:
-        _cap("feat", "regression", "tests", "echo 0 passed, 9 skipped")
-        entries = schema.load_evidence(
-            tmp / "reports" / "feat" / "regression.evidence.json")
-        assert entries[0]["nonempty_primitive"]["value"] == 0
+        rc = _cap("feat", "regression", "tests", "echo 0 passed, 9 skipped")
+        # fb-5d7b7cae0f30: the all-skip run is refused at capture, never recorded
+        assert rc != 0
+        assert not (tmp / "reports" / "feat" / "regression.evidence.json").exists()
+        refused = [json.loads(line) for line in
+                   (tmp / ".sprint" / "ledger.jsonl").read_text().splitlines()
+                   if '"capture_non_evidence"' in line]
+        assert [r["mode"] for r in refused] == ["nothing_counted"]
     finally:
         shutil.rmtree(tmp)
 
@@ -93,9 +97,14 @@ def test_v0120_gate_blocks_zero_executed_pass():
         (tmp / "reports" / "feat" / "regression.txt").write_text("PASS\n")
         _cap("feat", "regression", "tests", "echo 0 passed, 5 skipped")
         missing = gate._unsatisfied_exit_artifacts(_rev_spec(), "feat")
-        # v0.185.0: the false-clean block now carries a kind-aware remediation
-        assert any("nothing measurable ran" in m and "0 tests executed" in m
-                   for m in missing), missing
+        # fb-5d7b7cae0f30: the all-skip capture was refused, so the PASS has no evidence.
+        # The kind-aware message for an entry already in a file is held in
+        # test_capture_refuses_zero_count.py and test_false_clean_diagnosis.py.
+        assert any("no execution-evidence" in m for m in missing), missing
+        refused = [line for line in
+                   (tmp / ".sprint" / "ledger.jsonl").read_text().splitlines()
+                   if '"capture_non_evidence"' in line and '"nothing_counted"' in line]
+        assert len(refused) == 1        # blocked because the all-skip run was refused
     finally:
         shutil.rmtree(tmp)
 

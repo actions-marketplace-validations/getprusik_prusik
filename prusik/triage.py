@@ -13,29 +13,20 @@ from prusik import phases, schema
 from prusik.ledger import project_root, append
 
 
-def _first_token(s: str) -> str | None:
-    s = s.strip()
-    if not s:
-        return None
-    return s.split()[0].rstrip(",.")
-
-
 def parse_scope(scope_path: Path) -> dict:
     # v0.6.8: route through schema.extract_list_items so triage parsing
     # inherits HR skipping (v0.6.1), `+ ` / `* ` alt markers (v0.6.1),
     # and nested-bullet skipping (v0.6.7). Pre-v0.6.8 triage had its own
     # `_bullets` duplicate that was missing all three — a latent twin of
     # the consistency._bullet_items duplicate that v0.6.7 closed.
-    sections = schema.parse_sections(scope_path.read_text())
+    text = scope_path.read_text()
+    sections = schema.parse_sections(text)
     return {
-        "modules": [schema.extract_path_token(b)
-                    for b in schema.extract_list_items(
-                        sections.get("## Modules touched", ""))
-                    if schema.extract_path_token(b)],
+        "modules": list(dict.fromkeys(path for path, _is_new in schema.declared_modules(text))),
         "domains": [d.split()[0] for d in schema.extract_list_items(
             sections.get("## Domains", ""))],
-        "size": _first_token(sections.get("## Size", "")),
-        "milestone": _first_token(sections.get("## Milestone", "")),
+        "size": schema.extract_enum_value(sections.get("## Size", "")),
+        "milestone": schema.extract_enum_value(sections.get("## Milestone", "")),
         "related_work": schema.extract_list_items(
             sections.get("## Related work", "")),
         "risks": schema.extract_list_items(sections.get("## Risks", "")),
@@ -45,8 +36,8 @@ def parse_scope(scope_path: Path) -> dict:
 def parse_brief_meta(brief_path: Path) -> dict:
     sections = schema.parse_sections(brief_path.read_text())
     return {
-        "type": _first_token(sections.get("## Type", "")),
-        "priority": _first_token(sections.get("## Priority", "")) or "P2",
+        "type": schema.extract_enum_value(sections.get("## Type", "")),
+        "priority": schema.extract_enum_value(sections.get("## Priority", "")) or "P2",
     }
 
 

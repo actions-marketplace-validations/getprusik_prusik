@@ -1,23 +1,19 @@
 import argparse
-import re
 import sys
 
 from prusik import __version__
 
 
-# v0.6.4 (B9): single-source-of-truth slug validator. Applied to every
-# --feature argument via argparse type= so invalid slugs are rejected
-# at the CLI boundary with a clear error, before any downstream code
-# tries to use the slug as a path component.
+# v0.6.4 (B9): the slug validator, on every --feature argument via argparse
+# type=, so an invalid slug is rejected at the CLI boundary with a clear error,
+# before any downstream code tries to use it as a path component.
 #
 # Surfaced when /sprint-run domain-schema — strict on-rails: ... rendered
 # the em dash as the feature slug everywhere. Defense-in-depth: prusik engine
 # rejects garbage slugs even if the slash-command pre-flight is bypassed.
-_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-
-
 def _slug(value: str) -> str:
-    if not _SLUG_RE.match(value):
+    from prusik.phases import SLUG_RE
+    if not SLUG_RE.match(value):
         raise argparse.ArgumentTypeError(
             f"Invalid feature slug {value!r}: must be lowercase alphanumeric + "
             f"hyphens, starting with a letter (e.g. 'domain-schema'). "
@@ -97,7 +93,8 @@ def main():
     p_adv.add_argument("--allow-rewind", action="store_true",
                        help="Allow advancing to an earlier phase (recorded as phase_rewind)")
     p_brief = gsub.add_parser("brief", help="Validate a brief file")
-    p_brief.add_argument("path")
+    p_brief.add_argument("path", metavar="slug-or-path",
+                         help="feature slug (briefs/<slug>.md) or a path")
     gsub.add_parser("release-writer",
                     help="Release the shared-tree single-writer lease "
                          "(fb-0b9d0a6d1ce6) — audited hand-off when the "
@@ -133,9 +130,11 @@ def main():
     p_cap.add_argument("--phase", required=True,
                         help="reviewer phase, e.g. regression | conventions")
     p_cap.add_argument("--kind", required=True,
-                        choices=["tests", "lint", "types"],
+                        choices=["tests", "lint", "types", "policy"],
                         help="primitive parser: tests=executed count "
-                             "(strong); lint/types=tool-completed signal")
+                             "(strong); lint/types=tool-completed signal; "
+                             "policy=runs project_policy.command from sprint-config "
+                             "(no command after --) and records its exit code")
     p_cap.add_argument("--baseline-domain", default=None,
                         help="v0.18.0 — declare the domain this baseline covers "
                              "(e.g. 'integration+behavior'). Required by the gate "
@@ -156,10 +155,12 @@ def main():
     p_cap.add_argument("command", nargs=argparse.REMAINDER,
                         help="-- <verbatim command to run>")
     p_scope = gsub.add_parser("scope", help="Validate a scope file")
-    p_scope.add_argument("path")
+    p_scope.add_argument("path", metavar="slug-or-path",
+                         help="feature slug (design/<slug>/scope.md) or a path")
     p_plan = gsub.add_parser("plan", help="Validate a plan file "
                                           "(structure + plan ⊆ scope cross-ref)")
-    p_plan.add_argument("path")
+    p_plan.add_argument("path", metavar="slug-or-path",
+                        help="feature slug (design/<slug>/plan.md) or a path")
     p_fr = gsub.add_parser("fix-round",
                             help="Open/close a reviewer fix-round window "
                                  "(v0.5.7; expands writable to worktrees/*/** "
@@ -198,9 +199,14 @@ def main():
     p_fr_cls.add_argument("--pre-existing", type=int, default=0,
                           help="Residual failures that pre-date this sprint (inherited)")
     p_fr_cls.add_argument("--note", default="", help="Optional context")
-    frsub.add_parser("status",
-                      help="Print active fix-round metadata or '(no active fix-round)'. "
-                           "Used by reviewer agents to decide narrow-vs-full mode (v0.8.7).")
+    p_fr_status = frsub.add_parser(
+        "status",
+        help="Print active fix-round metadata or '(no active fix-round)'. "
+             "Used by reviewer agents to decide narrow-vs-full mode (v0.8.7).")
+    # fb-427305c05d6b: start and end require --feature, so a reviewer passed it here and
+    # argparse refused it. Accepted for symmetry; the active round is whichever is open.
+    p_fr_status.add_argument("--feature", type=_slug, default=None,
+                              help="Accepted for symmetry with start/end; not used.")
     # v0.73.0 — known-failure baselines (field finding #4): tolerate a git-stash-PROVEN
     # pre-existing flake without ever laundering a new failure.
     p_bl = gsub.add_parser("baseline",

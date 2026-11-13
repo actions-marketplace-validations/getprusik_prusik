@@ -11,13 +11,11 @@ runs the checks appropriate for the phase being left.
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
 from prusik import schema
 
-_BACKTICK_PATH_RE = re.compile(r"`\s*\+?\s*([^`]+?)\s*`")
 
 # Dependency / build / artifact directories that are never a sprint deliverable.
 # A worktree set up for a JS/TS build (prusik worktree-setup, findings #10/#11)
@@ -53,8 +51,8 @@ def _declared_deviations(project_root: Path, feature: str) -> set[str]:
     """File paths the builder DECLARED touching out-of-plan in
     design/<feature>/deviations.md — the sanctioned, visible record of legitimate
     mid-build drift (field finding #17). The boundary check credits these: an honest,
-    logged departure from scope is authorized; a silent one is not. Returns both
-    full path tokens and basenames so a partial-path log entry still matches."""
+    logged departure from scope is authorized; a silent one is not. Returns the tokens
+    `_logged_paths` reads from the log, for `_credit_deviations` to match."""
     dev = project_root / "design" / feature / "deviations.md"
     if not dev.exists():
         return set()
@@ -69,22 +67,52 @@ def _declared_deviations(project_root: Path, feature: str) -> set[str]:
     for m in _re.finditer(r"[\w./-]+\.\w+", text):
         # strip only a leading `./` — NOT all leading dots, which would turn a
         # dotfile like `.env.test` into `env.test` and miss it (#20.1).
-        tok = _re.sub(r"^\./", "", m.group(0))
-        if tok:
-            out.add(tok)
-            out.add(Path(tok).name)
+        out.update(_logged_paths(_re.sub(r"^\./", "", m.group(0)), project_root))
     return out
 
 
-def _is_declared(rel_str: str, declared: set[str]) -> bool:
-    if not declared:
-        return False
-    if rel_str in declared or Path(rel_str).name in declared:
-        return True
-    # a logged partial path (e.g. `errors/AppError.ts`) crediting a fuller
-    # worktree path (`src/errors/AppError.ts`), or vice-versa.
-    return any(rel_str.endswith(d) or d.endswith(rel_str)
-               for d in declared if "/" in d)
+def _logged_paths(token: str, project_root: Path) -> list[str]:
+    """What a logged token can mean. As written it is a partial path. A leading `/` marks a
+    path anchored at the project root, which names that path and nothing under another
+    directory: an absolute path inside the project, and a `worktrees/<role>/` path with its
+    role removed. A real `worktrees/` directory in the project keeps the written form. An
+    absolute path outside the project names nothing here."""
+    anchored = False
+    for base in (f"{project_root}/", f"{project_root.resolve()}/"):
+        if token.startswith(base):
+            token, anchored = token[len(base):], True
+            break
+    if token.startswith("/"):
+        return []
+    role_path = token.split("/", 2)
+    tokens = [f"/{token}" if anchored else token]
+    if len(role_path) == 3 and role_path[0] == "worktrees":
+        tokens.append(f"/{role_path[2]}")
+    return tokens
+
+
+def _credit_deviations(outside: set[str], declared: set[str]) -> tuple[set[str], dict[str, str]]:
+    """(the files the log credits, {file: the token that named it among others}), for the
+    distinct paths outside the boundary. A token names the paths whose trailing segments
+    equal it, so `errors/E.ts` is `src/errors/E.ts` and `x.py` is not `ax.py`. It credits
+    the one path it names. A token naming several credits none, because the log has not
+    said which one departed from scope (fb-82127b9f9ca9). A token equal to a whole path is
+    that path, so a file at the root can always be logged, and an anchored token names
+    only that path."""
+    credited: set[str] = set()
+    ambiguous: dict[str, str] = {}
+    for token in declared:
+        if token.startswith("/"):
+            named = [token[1:]] if token[1:] in outside else []
+        elif token in outside:
+            named = [token]
+        else:
+            named = [path for path in outside if f"/{path}".endswith(f"/{token}")]
+        if len(named) == 1:
+            credited.update(named)
+        elif named:
+            ambiguous.update(dict.fromkeys(named, token))
+    return credited, ambiguous
 
 
 def _git_worktree_changed_files(teammate_dir: Path) -> list[str] | None:
@@ -364,55 +392,10 @@ def assemble_worktrees_to_root(project_root: Path,
     return sorted(set(copied))
 
 
-def _first_token(body: str) -> str | None:
-    s = body.strip()
-    return s.split()[0].rstrip(",.") if s else None
-
-
-def _bullet_module_tokens(item: str) -> list[str]:
-    """All path tokens a Modules-touched bullet declares — the primary token AND any
-    additional backticked paths in the same bullet (fb-75fd9cfa7ead: a bullet
-    with two backticked paths, ``a.sh`` + ``b.yml``, previously registered only the
-    first)."""
-    toks: list[str] = []
-    primary, _is_new = schema.extract_module_token(item)
-    if primary:
-        toks.append(primary)
-    for m in _BACKTICK_PATH_RE.finditer(item):
-        cand = schema.extract_path_token(m.group(1))
-        if cand and cand not in toks:
-            toks.append(cand)
-    return toks
-
-
-def _modules_from(artifact_path: Path, section: str = "## Modules touched") -> set[str]:
+def _modules_from(artifact_path: Path) -> set[str]:
     if not artifact_path.exists():
         return set()
-    sections = schema.parse_sections(artifact_path.read_text())
-    # fb-6a4075fb15fe + fb-75fd9cfa7ead: tolerate a header SUFFIX
-    # ("## Modules touched (final)") and honour a later restated declaration — union
-    # the bodies of ALL sections whose header starts with the canonical one, not just
-    # the single exact-named contiguous block.
-    body = "\n".join(b for h, b in sections.items() if h.startswith(section))
-    # v0.5.5: delegate to schema.extract_module_token so this cross-artifact
-    # parser agrees with validate_scope on `+ `-prefixed and markdown-wrapped
-    # bullets. Previously raw extract_path_token captured `+` as a standalone
-    # path for `- + \`path\`` bullets, producing thousands of false
-    # builder-out-of-plan violations and deadlocking advance at building.
-    # v0.6.7: route through schema.extract_list_items so cross-artifact
-    # parsing inherits HR skipping (v0.6.1), `+ `/`* ` alt markers (v0.6.1),
-    # AND nested-bullet skipping (v0.6.7) — same code path = can't drift.
-    # Pre-v0.6.7 consistency had its own _bullet_items that lacked all three.
-    # Drop exclusion/commentary subsections (e.g. "### NOT in the touch-list") so they
-    # don't register as declared modules — same helper as validate_scope, so the two
-    # cross-artifact parsers can't drift (fb-085135ece453).
-    out: set[str] = set()
-    for item in schema.extract_list_items(
-            schema.strip_non_declaration_subsections(body)):
-        if not item.strip():
-            continue
-        out.update(_bullet_module_tokens(item))
-    return out
+    return {path for path, _is_new in schema.declared_modules(artifact_path.read_text())}
 
 
 def plan_within_scope(project_root: Path, feature: str) -> list[str]:
@@ -488,15 +471,13 @@ def builder_writes_within_plan(project_root: Path, feature: str) -> list[str]:
         boundary_src = "plan.md"
     else:
         return []
-    if not boundary_mods:
-        return []
     worktrees = project_root / "worktrees"
     if not worktrees.exists():
         return []
     build_report_glob = f"reports/{feature}/build-*.txt"
     declared = _declared_deviations(project_root, feature)   # #17 — sanctioned drift
     fan_out = _fan_out_prediction(project_root, feature)      # fb-7ab319116f42 — predicted
-    violations: list[str] = []
+    outside: list[tuple[str, str]] = []
     for teammate_dir in worktrees.iterdir():
         if not teammate_dir.is_dir():
             continue
@@ -533,15 +514,23 @@ def builder_writes_within_plan(project_root: Path, feature: str) -> list[str]:
                 continue
             if Path(rel_str).name in _DEP_LOCK_FILES:   # lockfiles (#20.2)
                 continue
-            if _is_declared(rel_str, declared):   # #17 — recorded in deviations.md
-                continue
             if rel_str in fan_out:   # fb-7ab319116f42 — blast-radius-PREDICTED fan-out
                 continue
-            if not any(rel_str.startswith(m.rstrip("/")) for m in boundary_mods):
-                violations.append(
-                    f"{teammate_dir.name}/{rel_str} is outside {boundary_src}'s "
-                    f"Modules touched {sorted(boundary_mods)}"
-                )
+            if not any(schema.module_covers(m, rel_str) for m in boundary_mods):
+                outside.append((teammate_dir.name, rel_str))
+    # #17 — recorded in deviations.md. Judged last, over every worktree, because whether a
+    # token names one file depends on all of them.
+    credited, ambiguous = _credit_deviations({rel for _name, rel in outside}, declared)
+    violations: list[str] = []
+    for name, rel_str in outside:
+        if rel_str in credited:
+            continue
+        violations.append(
+            f"{name}/{rel_str} is outside {boundary_src}'s "
+            f"Modules touched {sorted(boundary_mods)}"
+            + (f"; deviations.md's `{ambiguous[rel_str]}` names several files, so log the "
+               f"full path" if rel_str in ambiguous else "")
+        )
     if violations:
         return (
             [f"Builder files fall outside the sprint's declared boundary "
@@ -630,8 +619,10 @@ def worktrees_clean_of_cache_artifacts(project_root: Path, feature: str
 def brief_type_matches_scope(project_root: Path, feature: str) -> list[str]:
     """Obvious contradictions between brief type and derived size.
 
-    A bug_fix or doc or config with scope size L/XL usually means either
-    the brief mistyped or the scope overreached. Flag, don't block.
+    A bug_fix or doc or config with scope size L/XL can mean the brief mistyped or
+    the scope overreached, but an honest bug_fix can be large too: all 8 field hits
+    were. Flag, don't block: `gate.advance` prints this and records `size_type_flag`,
+    so it is not in PHASE_CHECKS.
     """
     brief = project_root / "briefs" / f"{feature}.md"
     scope = project_root / "design" / feature / "scope.md"
@@ -639,8 +630,8 @@ def brief_type_matches_scope(project_root: Path, feature: str) -> list[str]:
         return []
     b = schema.parse_sections(brief.read_text())
     s = schema.parse_sections(scope.read_text())
-    btype = _first_token(b.get("## Type", ""))
-    size = _first_token(s.get("## Size", ""))
+    btype = schema.extract_enum_value(b.get("## Type", ""))
+    size = schema.extract_enum_value(s.get("## Size", ""))
     small_types = {"bug_fix", "doc", "config"}
     if btype in small_types and size in ("L", "XL"):
         return [
@@ -690,7 +681,7 @@ def reconciliation_summary(project_root: Path, feature: str) -> dict | None:
 # no longer a phase gate. This is the structural cure for the m4-s8c Tier-1
 # rot (`plan_within_scope` blocked 3× on hand-list drift across ~10 rewinds).
 PHASE_CHECKS = {
-    "scoping": [brief_type_matches_scope],
+    "scoping": [],
     "planning": [],
     "building": [builder_writes_within_plan, worktrees_clean_of_cache_artifacts],
     "solo_execute": [builder_writes_within_plan, worktrees_clean_of_cache_artifacts],

@@ -15,6 +15,10 @@ import yaml
 
 from prusik.ledger import project_root
 
+# What a feature slug is: the one pattern behind `--feature` validation and the
+# slug-or-path argument of `gate brief|scope|plan`.
+SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
 
 def load_sprint_config(root: Path | None = None) -> dict | None:
     root = root or project_root()
@@ -182,6 +186,10 @@ _KIT_INTERNAL_ALWAYS_WRITABLE: tuple[str, ...] = (
     # boundary is not amendable mid-build; the honest log of departures from it
     # is). The boundary check credits files recorded here.
     "design/*/deviations.md",
+    # A second feature's pre-sprint charter acknowledgement. It must exist before that
+    # feature can start, so blocking it while another sprint is active is circular
+    # (fb-3adb150c6991). Its critic's report is already covered by reports/**.
+    "design/*/product-fit.md",
     # v0.15.0: OS-scratch namespaces. /tmp and project-local .runtime/ are
     # transient, gitignored everywhere, and the natural place agents reach
     # for scratch. Pre-v0.15.0 prusik was fighting agents over OS scratch
